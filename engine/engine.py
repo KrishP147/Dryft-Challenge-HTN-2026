@@ -12,7 +12,6 @@ import torch.nn.functional as F
 CAP_GRAN = 128
 MAX_STATES = 6
 ROPE_LEN = 8192
-WARM_SHAPES = [(1, 512, 32), (4, 2048, 32), (16, 512, 128)]
 
 
 def _rms(x, w, eps):
@@ -35,7 +34,7 @@ class _State:
 
 
 class Engine:
-    def __init__(self, model_path, dtype=torch.bfloat16, warmup=True):
+    def __init__(self, model_path, dtype=torch.bfloat16):
         self.dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
         with open(os.path.join(model_path, "config.json")) as f:
@@ -50,8 +49,6 @@ class Engine:
         self._build_rope(ROPE_LEN)
         self.states = {}
         self.pool = torch.cuda.graph_pool_handle() if self.dev.type == "cuda" else None
-        if warmup and self.dev.type == "cuda":
-            self._warmup()
 
     # ---------------------------------------------------------------- weights
     def _load(self, model_path):
@@ -142,14 +139,6 @@ class Engine:
         with torch.cuda.graph(g, pool=self.pool):
             self._decode_body(st)
         st.graph = g
-        torch.cuda.synchronize()
-
-    def _warmup(self):
-        for B, S, n in WARM_SHAPES:
-            ids = [[(7 * i + 13 * b) % 1000 + 100 for i in range(S)] for b in range(B)]
-            for _ in range(2):
-                for _ in self.generate(ids, n):
-                    pass
         torch.cuda.synchronize()
 
     # --------------------------------------------------------------- forwards

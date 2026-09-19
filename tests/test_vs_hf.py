@@ -20,7 +20,7 @@ model = Qwen3ForCausalLM(cfg).eval()
 
 with tempfile.TemporaryDirectory() as d:
     model.save_pretrained(d)
-    eng = Engine(d, dtype=torch.float32, warmup=False)
+    eng = Engine(d, dtype=torch.float32)
     for B, S, n in [(1, 20, 12), (3, 37, 9), (2, 130, 5)]:
         ids = torch.randint(0, 300, (B, S))
         ref = model.generate(
