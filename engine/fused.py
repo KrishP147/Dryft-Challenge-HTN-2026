@@ -531,6 +531,8 @@ SILU_CFG = {(9728, 2560): (32, 128, 3, 2)}
 
 
 EVEN_K = os.environ.get("ENGINE_EVENK", "1") != "0"  # mask-free GEMV when the shape divides evenly
+ATTN_TARGET = int(os.environ.get("ENGINE_ATTN_TARGET", "256"))
+ATTN_ST = int(os.environ.get("ENGINE_ATTN_ST", "3"))
 PF = int(os.environ.get("ENGINE_PF", "4"))
 TRIG = int(os.environ.get("ENGINE_TRIG", "1"))
 
@@ -594,7 +596,7 @@ class TritonOps:
         B = q.shape[0]
         bk = B * e.nkv
         nsplit = 1
-        while bk * nsplit < 128 and nsplit < 32:  # one wave of CTAs (tests/attn_rules.py: -4.7% vs >=256)
+        while bk * nsplit < ATTN_TARGET and nsplit < 32:  # CTA target for the split-KV grid
             nsplit *= 2
         ws = torch.empty((bk * W * G, nsplit, e.hd + 2), dtype=torch.float32, device=q.device)
         out = torch.empty((B * W, e.nh * e.hd), dtype=q.dtype, device=q.device)
@@ -603,7 +605,7 @@ class TritonOps:
             q, kc, vc, pos, ws, kc.shape[2], e.hd ** -0.5,
             NSPLIT=nsplit, G=G, W=W, GP=max(16, triton.next_power_of_2(W * G)), HD=e.hd,
             BLOCK_N=64, NKV=e.nkv, POS_STRIDE=1 if pos.numel() > 1 else 0,
-            num_warps=4, num_stages=3, PDL=PDL, TRIG=TRIG,
+            num_warps=4, num_stages=ATTN_ST, PDL=PDL, TRIG=TRIG,
         )
         _launch(
             _attn_combine_kernel, (bk * W * G,),

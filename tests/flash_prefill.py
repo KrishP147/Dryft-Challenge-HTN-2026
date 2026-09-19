@@ -74,7 +74,32 @@ def sdpa_ref(q, kc, vc, S):
     return o.transpose(1, 2)                                            # [B, S, NH, HD]
 
 
+def _one(B, S, cfg):
+    """time one config (own process: Triton 3.1 can abort the interpreter at compile time)"""
+    bf = torch.bfloat16
+    NH, NKV, HD = 32, 8, 128
+    cap = S + 128
+    q = torch.randn(B, S, NH, HD, device="cuda", dtype=bf)
+    kc = torch.randn(B, NKV, cap, HD, device="cuda", dtype=bf); vc = torch.randn_like(kc)
+    flops = 4 * B * NH * (S * (S + 1) / 2) * HD
+    ref = sdpa_ref(q, kc, vc, S)
+
+    def tm(fn, n=8):
+        for _ in range(3): fn()
+        torch.cuda.synchronize(); s_, e_ = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        s_.record()
+        for _ in range(n): fn()
+        e_.record(); torch.cuda.synchronize(); return s_.elapsed_time(e_) / n
+
+    out = flash_prefill(q, kc, vc, S, cfg)
+    d = (out.float() - ref.float()).abs().max().item()
+    t_ref = tm(lambda: sdpa_ref(q, kc, vc, S))
+    t = tm(lambda: flash_prefill(q, kc, vc, S, cfg))
+    print(f"RESULT B{B} S{S} cfg{cfg}: triton {t:.3f} ms ({flops/t/1e9:.0f} TFLOP/s) SDPA {t_ref:.3f} ms ({flops/t_ref/1e9:.0f}) maxdiff {d:.4f} -> {100*(t_ref/t-1):+.1f}%")
+
+
 if __name__ == "__main__":
+    import subprocess
     if CHECK:
         torch.manual_seed(0)
         B, S, NH, NKV, HD, cap = 2, 45, 8, 2, 32, 64
@@ -83,35 +108,16 @@ if __name__ == "__main__":
             d = (flash_prefill(q, kc, vc, S, cfg) - sdpa_ref(q, kc, vc, S)).abs().max().item()
             print(f"cfg {cfg}: max|diff| {d:.2e}"); assert d < 1e-4
         print("FLASH CHECK OK")
-        sys.exit(0)
-    bf = torch.bfloat16
-    for B, S in ((4, 2048), (16, 512), (1, 512), (2, 3000), (1, 8192)):
-        NH, NKV, HD = 32, 8, 128
-        cap = S + 128
-        q = torch.randn(B, S, NH, HD, device="cuda", dtype=bf)
-        kc = torch.randn(B, NKV, cap, HD, device="cuda", dtype=bf); vc = torch.randn_like(kc)
-        flops = 4 * B * NH * (S * (S + 1) / 2) * HD
-
-        def tm(fn, n=8):
-            for _ in range(3): fn()
-            torch.cuda.synchronize(); s_, e_ = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            s_.record()
-            for _ in range(n): fn()
-            e_.record(); torch.cuda.synchronize(); return s_.elapsed_time(e_) / n
-
-        ref = sdpa_ref(q, kc, vc, S)
-        t_ref = tm(lambda: sdpa_ref(q, kc, vc, S))
-        res = []
-        for cfg in itertools.product((128, 64), (64, 128, 32), (4, 8), (2, 3, 4)):
-            try:
-                out = flash_prefill(q, kc, vc, S, cfg)
-                d = (out.float() - ref.float()).abs().max().item()
-                if d > 0.05:
-                    continue
-                res.append((tm(lambda: flash_prefill(q, kc, vc, S, cfg)), cfg, d))
-            except Exception:
-                continue
-        res.sort()
-        print(f"B{B} S{S}: SDPA/FA2 {t_ref:.3f} ms ({flops/t_ref/1e9:.0f} TFLOP/s) | triton best",
-              [(round(t, 3), c, round(dd, 4)) for t, c, dd in res[:3]],
-              f"-> {flops/res[0][0]/1e9:.0f} TFLOP/s, {100*(t_ref/res[0][0]-1):+.1f}% vs SDPA" if res else "(none valid)", flush=True)
+    elif "--one" in sys.argv:
+        a = sys.argv[sys.argv.index("--one") + 1:]
+        _one(int(a[0]), int(a[1]), tuple(int(x) for x in a[2:6]))
+    else:
+        shapes = [tuple(map(int, x.split(","))) for x in (sys.argv[1:] or ["4,2048"])]
+        for B, S in shapes:
+            for cfg in itertools.product((128, 64), (64, 128), (4, 8), (2, 3)):
+                try:
+                    r = subprocess.run([sys.executable, __file__, "--one", str(B), str(S), *map(str, cfg)], capture_output=True, text=True, timeout=180)
+                    line = [l for l in r.stdout.splitlines() if l.startswith("RESULT")]
+                    print(line[0] if line else f"B{B} S{S} cfg{cfg}: FAILED (rc={r.returncode})", flush=True)
+                except subprocess.TimeoutExpired:
+                    print(f"B{B} S{S} cfg{cfg}: timeout", flush=True)
