@@ -33,52 +33,60 @@ GROUPS = (  # (label, substrings) - first match wins
 
 eng = Engine(os.environ.get("MODEL", "/workspace/model"))
 g = torch.Generator().manual_seed(0)
-
 for spec in SHAPES:
-    B, S, n = map(int, spec.split(","))
-    ids = torch.randint(1000, 100000, (B, S), generator=g).tolist()
-    list(eng.generate(ids, n))  # warm + capture
-    cap = -(-(S + n) // CAP_GRAN) * CAP_GRAN
-    st = eng.states[(B, cap, 1)]
-    if st.graph is None:
-        print(f"B{B} {S}->{n}: no decode graph, skipping")
-        continue
+  with torch.inference_mode():  # the decode graph was captured on inference tensors
+        B, S, n = map(int, spec.split(","))
+        ids = torch.randint(1000, 100000, (B, S), generator=g).tolist()
+        list(eng.generate(ids, n))  # warm + capture
+        cap = -(-(S + n) // CAP_GRAN) * CAP_GRAN
+        st = eng.states[(B, cap, 1)]
+        if st.graph is None:
+            print(f"B{B} {S}->{n}: no decode graph, skipping")
+            continue
 
-    for _ in range(5):
-        st.graph.replay()
-    torch.cuda.synchronize()
-    s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    s.record()
-    for _ in range(REPLAYS):
-        st.graph.replay()
-    e.record()
-    torch.cuda.synchronize()
-    step_us = s.elapsed_time(e) / REPLAYS * 1e3
-
-    with profile(activities=[ProfilerActivity.CUDA]) as p:
-        for _ in range(REPLAYS):
+        # every replay does pos += 1; rewind before each block or attention reads past cap
+        assert S + REPLAYS <= cap, f"cap {cap} too small for {REPLAYS} replays from {S}"
+        st.pos.fill_(S)
+        for _ in range(5):
             st.graph.replay()
         torch.cuda.synchronize()
-    rows = [x for x in p.key_averages() if x.self_device_time_total > 0]
+        st.pos.fill_(S)
+        s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        s.record()
+        for _ in range(REPLAYS):
+            st.graph.replay()
+        e.record()
+        torch.cuda.synchronize()
+        step_us = s.elapsed_time(e) / REPLAYS * 1e3
 
-    buckets, counts, seen = {}, {}, set()
-    for x in rows:
-        label = next((lab for lab, keys in GROUPS if any(k in x.key for k in keys)), None)
-        if label is None:
-            label = f"? {x.key[:40]}"
-        buckets[label] = buckets.get(label, 0.0) + x.self_device_time_total / REPLAYS
-        counts[label] = counts.get(label, 0) + x.count / REPLAYS
-        seen.add(x.key)
-    busy = sum(buckets.values())
+        st.pos.fill_(S)
+        with profile(activities=[ProfilerActivity.CUDA]) as p:
+            for _ in range(REPLAYS):
+                st.graph.replay()
+            torch.cuda.synchronize()
+        rows = [x for x in p.key_averages() if x.self_device_time_total > 0]
 
-    kv_gb = 2 * eng.L * B * eng.nkv * (S + n // 2) * eng.hd * 2 / 1e9
-    w_gb = (sum(l.wqkv.numel() + l.wo.numel() + l.wgu.numel() + l.wd.numel() for l in eng.layers)
-            + eng.lm_head.numel()) * 2 / 1e9
-    roof_us = (w_gb + kv_gb) / 3.35 * 1e3
+        buckets, counts, seen = {}, {}, set()
+        for x in rows:
+            label = next((lab for lab, keys in GROUPS if any(k in x.key for k in keys)), None)
+            if label is None:
+                label = f"? {x.key[:40]}"
+            buckets[label] = buckets.get(label, 0.0) + x.self_device_time_total / REPLAYS
+            counts[label] = counts.get(label, 0) + x.count / REPLAYS
+            seen.add(x.key)
+        busy = sum(buckets.values())
 
-    print(f"\nB{B} {S}->{n}: step {step_us:7.1f} us  kernels busy {busy:7.1f} us "
-          f"({100*busy/step_us:4.1f}%)  gap {step_us-busy:6.1f} us")
-    print(f"   roofline {roof_us:6.1f} us ({w_gb:.2f} GB weights + {kv_gb:.2f} GB kv) "
-          f"-> {100*roof_us/step_us:4.1f}% of step")
-    for label, us in sorted(buckets.items(), key=lambda kv: -kv[1]):
-        print(f"   {us:8.1f} us {100*us/step_us:5.1f}%  n={counts[label]:6.1f}  {label}")
+        kv_gb = 2 * eng.L * B * eng.nkv * (S + n // 2) * eng.hd * 2 / 1e9
+        w_gb = (sum(l.wqkv.numel() + l.wo.numel() + l.wgu.numel() + l.wd.numel() for l in eng.layers)
+                + eng.lm_head.numel()) * 2 / 1e9
+        roof_us = (w_gb + kv_gb) / 3.35 * 1e3
+
+        # with PDL a kernel spins in griddepcontrol.wait for its producer and the
+        # profiler charges that wait to the waiting kernel, so the sum can exceed the
+        # step. Run with ENGINE_PDL=0 for clean per-kernel attribution.
+        print(f"\nB{B} {S}->{n}: step {step_us:7.1f} us  sum of kernel times {busy:7.1f} us "
+              f"({100*busy/step_us:4.1f}% of step; >100% = PDL overlap/wait)")
+        print(f"   roofline {roof_us:6.1f} us ({w_gb:.2f} GB weights + {kv_gb:.2f} GB kv) "
+              f"-> {100*roof_us/step_us:4.1f}% of step")
+        for label, us in sorted(buckets.items(), key=lambda kv: -kv[1]):
+            print(f"   {us:8.1f} us {100*us/step_us:5.1f}%  n={counts[label]:6.1f}  {label}")
