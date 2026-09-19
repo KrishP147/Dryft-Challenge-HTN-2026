@@ -18,7 +18,7 @@ torch_stub = types.ModuleType("torch")
 torch_stub.__spec__ = importlib.machinery.ModuleSpec("torch", None)
 sys.modules["torch"] = torch_stub
 sys.path.insert(0, "engine")
-from fused import _add_rms_kernel, _silu_mul_kernel  # noqa: E402
+from fused import _add_rms_kernel, _qkv_post_kernel, _silu_mul_kernel  # noqa: E402
 
 
 def check(code, operation):
@@ -145,6 +145,82 @@ for row in range(ROWS):
         actual = from_bf16(host_y[idx])
         assert abs(actual - expected) < 0.02, (idx, actual, expected)
 print(f"Add plus RMSNorm fused kernel: GPU correctness OK on SM{sm}")
+for ptr in buffers:
+    call("cuMemFree_v2", ptr)
+call("cuModuleUnload", module)
+
+# The final prefill layer computes only each sequence's last query, while all
+# prompt keys and values must still reach the cache. Check that exact mapping.
+B, S, CAP, NH, NKV, HD = 2, 3, 8, 4, 2, 8
+TOTAL = (NH + 2 * NKV) * HD
+source = ASTSource(
+    _qkv_post_kernel,
+    {**{i: "*bf16" for i in range(9)}, 5: "*i64",
+     9: "i32", 10: "i32", 11: "i32", 12: "fp32"},
+    {13: NH, 14: NKV, 15: HD, 16: False, 17: True},
+)
+kernel = triton.compile(source, target=GPUTarget("cuda", sm, 32),
+                        options={"num_warps": 1, "num_stages": 1})
+binary = c.create_string_buffer(kernel.asm["cubin"])
+module = c.c_void_p()
+call("cuModuleLoadData", c.byref(module), binary)
+function = c.c_void_p()
+call("cuModuleGetFunction", c.byref(function), module, kernel.metadata.name.encode())
+host_qkv = (c.c_uint16 * (B * S * TOTAL))(
+    *(bf16(((i % 31) - 15) / 16) for i in range(B * S * TOTAL)))
+host_qn = (c.c_uint16 * HD)(*(bf16(1.0) for _ in range(HD)))
+host_kn = (c.c_uint16 * HD)(*(bf16(1.0) for _ in range(HD)))
+host_cos = (c.c_uint16 * (S * HD))(*(bf16(1.0) for _ in range(S * HD)))
+host_sin = (c.c_uint16 * (S * HD))()
+host_pos = (c.c_int64 * 1)(0)
+host_q = (c.c_uint16 * (B * NH * HD))()
+host_k = (c.c_uint16 * (B * NKV * CAP * HD))()
+host_v = (c.c_uint16 * (B * NKV * CAP * HD))()
+hosts = [host_qkv, host_qn, host_kn, host_cos, host_sin, host_pos,
+         host_q, host_k, host_v]
+buffers = [c.c_uint64() for _ in hosts]
+for ptr, buf in zip(buffers, hosts):
+    call("cuMemAlloc_v2", c.byref(ptr), c.sizeof(buf))
+    call("cuMemcpyHtoD_v2", ptr, buf, c.sizeof(buf))
+arg_b, arg_s, arg_cap, arg_eps = c.c_int(B), c.c_int(S), c.c_int(CAP), c.c_float(EPS)
+args = (c.c_void_p * 13)(*(c.addressof(p) for p in buffers),
+                         c.addressof(arg_b), c.addressof(arg_s),
+                         c.addressof(arg_cap), c.addressof(arg_eps))
+grid = B * NH + B * S * 2 * NKV
+call("cuLaunchKernel", function, grid, 1, 1, 32, 1, 1, 0, None, args, None)
+call("cuCtxSynchronize")
+for ptr, buf in zip(buffers[6:], hosts[6:]):
+    call("cuMemcpyDtoH_v2", buf, ptr, c.sizeof(buf))
+
+
+def expected_head(t, h):
+    off = t * TOTAL + h * HD
+    values = [from_bf16(host_qkv[off + d]) for d in range(HD)]
+    var = sum(v * v for v in values) / HD
+    return [from_bf16(bf16(v / math.sqrt(var + EPS))) for v in values]
+
+
+for b in range(B):
+    for h in range(NH):
+        expected = expected_head(b * S + S - 1, h)
+        for d in range(HD):
+            actual = from_bf16(host_q[(b * NH + h) * HD + d])
+            assert abs(actual - expected[d]) < 0.03, ("Q", b, h, d, actual, expected[d])
+    for h in range(NKV):
+        for s in range(S):
+            t = b * S + s
+            expected = expected_head(t, NH + h)
+            for d in range(HD):
+                dst = ((b * NKV + h) * CAP + s) * HD + d
+                actual = from_bf16(host_k[dst])
+                assert abs(actual - expected[d]) < 0.03, ("K", b, h, s, d, actual, expected[d])
+                src = t * TOTAL + (NH + NKV + h) * HD + d
+                assert host_v[dst] == host_qkv[src], ("V", b, h, s, d)
+        for s in range(S, CAP):
+            for d in range(HD):
+                dst = ((b * NKV + h) * CAP + s) * HD + d
+                assert host_k[dst] == 0 and host_v[dst] == 0, ("cache tail", b, h, s, d)
+print(f"Last-query QKV prefill kernel: GPU correctness OK on SM{sm}")
 for ptr in buffers:
     call("cuMemFree_v2", ptr)
 call("cuModuleUnload", module)
