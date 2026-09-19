@@ -55,6 +55,18 @@ class _TorchOps:
         g, u = gu.chunk(2, -1)
         return F.silu(g) * u
 
+    def attn_decode(self, q, kc, vc, pos):
+        e = self.e
+        B, cap = q.shape[0], kc.shape[2]
+        mask = (
+            torch.zeros(cap, dtype=q.dtype, device=q.device)
+            .masked_fill_(torch.arange(cap, device=q.device) > pos, float("-inf"))
+            .view(1, 1, 1, cap)
+        )
+        return F.scaled_dot_product_attention(
+            q.reshape(B, e.nkv, e.nh // e.nkv, e.hd), kc, vc, attn_mask=mask
+        ).reshape(B, e.nh * e.hd)
+
     def qkv_post(self, qkv, l, kc, vc, B, S, pos):
         e = self.e
         nh, nkv, hd = e.nh, e.nkv, e.hd
@@ -200,21 +212,12 @@ class Engine:
         decode = pos is not None
         h = self.embed[tokens]
         a = ops.rms(h, self.layers[0].ln1)
-        if decode:
-            mask = (
-                torch.zeros(st.cap, dtype=self.dtype, device=self.dev)
-                .masked_fill_(st.ar > pos, float("-inf"))
-                .view(1, 1, 1, st.cap)
-            )
         last = self.L - 1
         for i, l in enumerate(self.layers):
             kc, vc = st.kc[i], st.vc[i]
             q = ops.qkv_post(F.linear(a, l.wqkv), l, kc, vc, B, S, pos)
             if decode:
-                # GQA as q_len=group: [B, nkv, nh//nkv, hd] attends to [B, nkv, cap, hd]
-                o = F.scaled_dot_product_attention(
-                    q.reshape(B, nkv, nh // nkv, hd), kc, vc, attn_mask=mask
-                ).reshape(B, nh * hd)
+                o = ops.attn_decode(q, kc, vc, pos)
             else:
                 o = F.scaled_dot_product_attention(
                     q, kc[:, :, :S], vc[:, :, :S], is_causal=True, enable_gqa=True

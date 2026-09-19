@@ -110,6 +110,68 @@ def _qkv_post_kernel(
         tl.store(vo + HALF + offs, v2)
 
 
+@triton.jit
+def _attn_split_kernel(
+    q_ptr, k_ptr, v_ptr, pos_ptr, ws_ptr, cap, sm_scale,
+    NSPLIT: tl.constexpr, G: tl.constexpr, GP: tl.constexpr, HD: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # flash-decoding partial: one program per (batch*kv_head, split). The G query
+    # heads sharing a kv head are the M rows of the dot (padded to GP >= 16).
+    bk = tl.program_id(0)
+    sp = tl.program_id(1)
+    L = tl.load(pos_ptr) + 1
+    chunk = (L + NSPLIT - 1) // NSPLIT
+    start = sp * chunk
+    end = tl.minimum(start + chunk, L)
+    rows = tl.arange(0, GP)
+    d = tl.arange(0, HD)
+    rmask = rows < G
+    q = tl.load(
+        q_ptr + (bk * G + rows[:, None]) * HD + d[None, :], mask=rmask[:, None], other=0.0
+    )
+    m_i = tl.full([GP], float("-inf"), tl.float32)
+    l_i = tl.zeros([GP], tl.float32)
+    acc = tl.zeros([GP, HD], tl.float32)
+    kv_base = bk.to(tl.int64) * cap * HD
+    for n0 in range(start, end, BLOCK_N):
+        n = n0 + tl.arange(0, BLOCK_N)
+        nm = n < end
+        k = tl.load(k_ptr + kv_base + n[:, None] * HD + d[None, :], mask=nm[:, None], other=0.0)
+        sc = tl.dot(q, tl.trans(k)) * sm_scale
+        sc = tl.where(nm[None, :], sc, float("-inf"))
+        m_new = tl.maximum(m_i, tl.max(sc, 1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(sc - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        v = tl.load(v_ptr + kv_base + n[:, None] * HD + d[None, :], mask=nm[:, None], other=0.0)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        m_i = m_new
+    wb = ((bk * G + rows) * NSPLIT + sp) * (HD + 2)
+    tl.store(ws_ptr + wb[:, None] + d[None, :], acc, mask=rmask[:, None])
+    tl.store(ws_ptr + wb + HD, m_i, mask=rmask)
+    tl.store(ws_ptr + wb + HD + 1, l_i, mask=rmask)
+
+
+@triton.jit
+def _attn_combine_kernel(
+    ws_ptr, out_ptr, NSPLIT: tl.constexpr, SP: tl.constexpr, HD: tl.constexpr
+):
+    r = tl.program_id(0)
+    s = tl.arange(0, SP)
+    sm = s < NSPLIT
+    base = (r * NSPLIT + s) * (HD + 2)
+    m = tl.load(ws_ptr + base + HD, mask=sm, other=float("-inf"))
+    l = tl.load(ws_ptr + base + HD + 1, mask=sm, other=0.0)
+    mx = tl.max(m, 0)
+    w = tl.exp(m - mx)
+    lt = tl.sum(l * w, 0)
+    d = tl.arange(0, HD)
+    acc = tl.load(ws_ptr + base[:, None] + d[None, :], mask=sm[:, None], other=0.0)
+    o = tl.sum(acc * w[:, None], 0) / lt
+    tl.store(out_ptr + r * HD + d, o.to(out_ptr.dtype.element_ty))
+
+
 class TritonOps:
     def __init__(self, e):
         self.e = e
@@ -150,3 +212,23 @@ class TritonOps:
             NH=e.nh, NKV=e.nkv, HD=e.hd, DECODE=pos is not None, num_warps=1,
         )
         return q
+
+    def attn_decode(self, q, kc, vc, pos):
+        """q: [B, nh, 1, hd] (contiguous). Attends over kc/vc[:, :, :pos+1]. -> [B, nh*hd]"""
+        e = self.e
+        B, G = q.shape[0], e.nh // e.nkv
+        bk = B * e.nkv
+        nsplit = 1
+        while bk * nsplit < 256 and nsplit < 32:
+            nsplit *= 2
+        ws = torch.empty((bk * G, nsplit, e.hd + 2), dtype=torch.float32, device=q.device)
+        out = torch.empty((B, e.nh * e.hd), dtype=q.dtype, device=q.device)
+        _attn_split_kernel[(bk, nsplit)](
+            q, kc, vc, pos, ws, kc.shape[2], e.hd ** -0.5,
+            NSPLIT=nsplit, G=G, GP=max(16, triton.next_power_of_2(G)), HD=e.hd,
+            BLOCK_N=64, num_warps=4, num_stages=2,
+        )
+        _attn_combine_kernel[(bk * G,)](
+            ws, out, NSPLIT=nsplit, SP=nsplit, HD=e.hd, num_warps=1
+        )
+        return out
