@@ -16,6 +16,7 @@ except Exception as _e:  # no triton / import failure: torch ops only
     _FUSED_ERR = repr(_e)
 
 CAP_GRAN = 128
+PREFILL_GRAPH_MAX = int(os.environ.get("ENGINE_PREFILL_GRAPH", "4096"))  # B*S at or below this: prefill runs as a CUDA graph (0 = off)
 SPEC = os.environ.get("ENGINE_SPEC", "0") == "1"  # exact n-gram speculation, B=1 only; off by default (timing is content-dependent)
 SPEC_W_MAX = 7  # verify width: 1 known token + up to 6 n-gram drafts
 SPEC_ROWS = 16  # max B*W rows through the skinny GEMVs
@@ -227,6 +228,7 @@ class Engine:
         st.pos = torch.zeros(1, dtype=torch.long, device=self.dev)
         st.ar = torch.arange(cap, device=self.dev)
         st.graph = None
+        st.pgraphs = {}
         st.tried_graph = graph
         if W > 1:  # speculative verify buffers: one flat H2D copy in, one D2H out
             cu = self.dev.type == "cuda"
@@ -306,7 +308,37 @@ class Engine:
         return logits.argmax(-1)
 
     def _prefill(self, ids, st):
-        st.tok.copy_(self._forward(st, ids.reshape(-1), ids.shape[1], None))
+        B, S = ids.shape
+        if st.tried_graph and self.dev.type == "cuda" and 0 < B * S <= PREFILL_GRAPH_MAX:
+            pg = st.pgraphs.get(S)
+            if pg is None:
+                pg = st.pgraphs[S] = self._capture_prefill(st, B, S)
+            if pg is not False:
+                pg[0].copy_(ids)
+                pg[1].replay()
+                return
+        st.tok.copy_(self._forward(st, ids.reshape(-1), S, None))
+
+    def _capture_prefill(self, st, B, S):
+        """Small prefills are CPU-launch-bound (~500 kernel launches): replay them from a graph."""
+        try:
+            sid = torch.zeros((B, S), dtype=torch.long, device=self.dev)
+            body = lambda: st.tok.copy_(self._forward(st, sid.reshape(-1), S, None))
+            s_ = torch.cuda.Stream()
+            s_.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s_):
+                body()
+                body()
+            torch.cuda.current_stream().wait_stream(s_)
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=self.pool):
+                body()
+            torch.cuda.synchronize()
+            return (sid, g)
+        except Exception as e:
+            print(f"[engine] prefill graph capture failed for B={B} S={S}: {e!r}")
+            return False
 
     def _decode_body(self, st):
         st.tok.copy_(self._forward(st, st.tok, 1, st.pos))
