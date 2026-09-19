@@ -4,9 +4,127 @@ Each kernel mirrors the reference's bf16 rounding points (explicit casts), so
 results track the torch path within the tie margin. The engine self-tests this
 op set against the torch ops at load and falls back if anything is off.
 """
+import os
+
 import torch
 import triton
 import triton.language as tl
+
+# Programmatic dependent launch (PDL): a kernel may start (and prefetch its weights)
+# while the previous kernel in the stream is still finishing; it calls
+# griddepcontrol.wait before touching anything the previous kernel produced.
+# Enabled by patching Triton's generated C launcher: kernels whose packed metadata
+# has cluster_dim_x == _PDL_MAGIC launch via cuLaunchKernelEx + the PDL attribute.
+_PDL_MAGIC = 7
+PDL = os.environ.get("ENGINE_PDL", "1") != "0" and os.environ.get("TRITON_INTERPRET") != "1"
+
+
+def _install_pdl():
+    from triton.runtime import driver
+
+    # the live driver module is not importable under its package name: patch the
+    # globals dict the active launcher class actually resolves make_launcher in
+    g = driver.active.launcher_cls.__init__.__globals__
+    orig = g["make_launcher"]
+    old = "CUDA_CHECK(cuLaunchKernel(function, gridX, gridY, gridZ, 32*num_warps, 1, 1, shared_memory, stream, params, 0));"
+    new = (
+        "if (clusterDimX == 7) {\n"
+        "  CUlaunchAttribute pdlAttr[1];\n"
+        "  pdlAttr[0].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;\n"
+        "  pdlAttr[0].value.programmaticStreamSerializationAllowed = 1;\n"
+        "  CUlaunchConfig pdlCfg;\n"
+        "  pdlCfg.gridDimX = gridX; pdlCfg.gridDimY = gridY; pdlCfg.gridDimZ = gridZ;\n"
+        "  pdlCfg.blockDimX = 32 * num_warps; pdlCfg.blockDimY = 1; pdlCfg.blockDimZ = 1;\n"
+        "  pdlCfg.sharedMemBytes = shared_memory; pdlCfg.hStream = stream;\n"
+        "  pdlCfg.attrs = pdlAttr; pdlCfg.numAttrs = 1;\n"
+        "  static cuLaunchKernelEx_t pdlHandle = NULL;\n"
+        "  if (pdlHandle == NULL) pdlHandle = getLaunchKernelExHandle();\n"
+        "  CUDA_CHECK(pdlHandle(&pdlCfg, function, params, 0));\n"
+        "} else {\n"
+        "  " + old + "\n}"
+    )
+
+    def patched(constants, signature, ids):
+        src = orig(constants, signature, ids)
+        assert old in src
+        return src.replace(old, new, 1)
+
+    g["make_launcher"] = patched
+
+
+if PDL:
+    try:
+        _install_pdl()
+    except Exception as _e:  # unknown triton layout: plain launches
+        print(f"[fused] PDL launcher patch failed: {_e!r}")
+        PDL = False
+
+
+def _launch(fn, grid, *args, **kw):
+    """fn[grid](*args, **kw), then mark the compiled kernel for PDL launches."""
+    k = fn[grid](*args, **kw)
+    if PDL and k is not None and k.packed_metadata[3] != _PDL_MAGIC:
+        k.packed_metadata = (*k.packed_metadata[:3], _PDL_MAGIC, 1, 1)
+    return k
+
+
+@triton.jit
+def _gdc_wait():
+    tl.inline_asm_elementwise("griddepcontrol.wait;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+
+
+@triton.jit
+def _gdc_launch():
+    tl.inline_asm_elementwise("griddepcontrol.launch_dependents;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+
+
+@triton.jit
+def _pdl_probe_kernel(x_ptr, PDL: tl.constexpr):
+    if PDL:
+        _gdc_launch()
+        _gdc_wait()
+    i = tl.arange(0, 1024)
+    tl.store(x_ptr + i, tl.load(x_ptr + i) + 1.0)
+
+
+def _probe_pdl():
+    """Chain of dependent PDL launches inside a CUDA graph must still count exactly;
+    on any error or wrong result PDL is switched off (plain launches)."""
+    global PDL
+    if not PDL:
+        return
+    try:
+        x = torch.zeros(1024, device="cuda")
+        n = 64
+        for _ in range(3):  # compile + mark
+            _launch(_pdl_probe_kernel, (1,), x, PDL=True)
+        torch.cuda.synchronize()
+        x.zero_()
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(n):
+                _launch(_pdl_probe_kernel, (1,), x, PDL=True)
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        assert bool((x == n).all()), "eager PDL chain miscounted"
+        x.zero_()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for _ in range(n):
+                _launch(_pdl_probe_kernel, (1,), x, PDL=True)
+        for r in range(3):
+            g.replay()
+        torch.cuda.synchronize()
+        assert bool((x == 3 * n).all()), "graph PDL chain miscounted"
+    except Exception as e:
+        print(f"[fused] PDL probe failed, disabling: {e!r}")
+        PDL = False
+
+
+@triton.jit
+def _l2_prefetch(ptrs):
+    tl.inline_asm_elementwise("prefetch.global.L2 [$1];", "=r,l", [ptrs], dtype=tl.int32, is_pure=False, pack=1)
 
 
 @triton.jit
@@ -114,10 +232,14 @@ def _qkv_post_kernel(
     qkv_ptr, qn_ptr, kn_ptr, cos_ptr, sin_ptr, pos_ptr,
     q_ptr, kc_ptr, vc_ptr, S, cap, eps,
     NH: tl.constexpr, NKV: tl.constexpr, HD: tl.constexpr, DECODE: tl.constexpr,
-    POS_STRIDE: tl.constexpr,
+    POS_STRIDE: tl.constexpr, PDL: tl.constexpr = False, TRIG: tl.constexpr = 0,
 ):
     # one program per (token, head): q/k get qk-norm + rope, v is copied; k/v go
     # straight into the static cache, q into [B, NH, S, HD].
+    if PDL:
+        if TRIG < 2:
+            _gdc_launch()
+        _gdc_wait()
     t = tl.program_id(0)
     hidx = tl.program_id(1)
     b = t // S
@@ -173,7 +295,12 @@ def _attn_split_kernel(
     q_ptr, k_ptr, v_ptr, pos_ptr, ws_ptr, cap, sm_scale,
     NSPLIT: tl.constexpr, G: tl.constexpr, W: tl.constexpr, GP: tl.constexpr,
     HD: tl.constexpr, BLOCK_N: tl.constexpr, NKV: tl.constexpr, POS_STRIDE: tl.constexpr,
+    PDL: tl.constexpr = False, TRIG: tl.constexpr = 0,
 ):
+    if PDL:
+        if TRIG < 2:
+            _gdc_launch()
+        _gdc_wait()
     # flash-decoding partial: one program per (batch*kv_head, split). The W query
     # tokens x G query heads sharing a kv head are the M rows of the dot (padded to
     # GP >= 16); row r = s*G + g sees keys <= pos + s (causal among the W tokens).
@@ -220,8 +347,12 @@ def _attn_split_kernel(
 @triton.jit
 def _attn_combine_kernel(
     ws_ptr, out_ptr, NSPLIT: tl.constexpr, SP: tl.constexpr, HD: tl.constexpr,
-    NKV: tl.constexpr, G: tl.constexpr, W: tl.constexpr,
+    NKV: tl.constexpr, G: tl.constexpr, W: tl.constexpr, PDL: tl.constexpr = False, TRIG: tl.constexpr = 0,
 ):
+    if PDL:
+        if TRIG < 2:
+            _gdc_launch()
+        _gdc_wait()
     r = tl.program_id(0)
     s = tl.arange(0, SP)
     sm = s < NSPLIT
@@ -246,7 +377,8 @@ def _attn_combine_kernel(
 def _gemv_kernel(
     x_ptr, w_ptr, out_ptr, M, N, K, kps, stride_om,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, FINAL: tl.constexpr,
-    CM: tl.constexpr = "", EV: tl.constexpr = "",
+    CM: tl.constexpr = "", EV: tl.constexpr = "", PDL: tl.constexpr = False, PF: tl.constexpr = 16,
+    TRIG: tl.constexpr = 0,
 ):
     # skinny GEMM: out[M, N] = x[M, K] @ w[N, K]^T, M <= BM (16). Each program owns
     # BN rows of w and one K-slice (split-K). Bandwidth-bound: w is read once.
@@ -258,6 +390,15 @@ def _gemv_kernel(
     nm = rn < N
     k_lo = pid_k * kps
     k_hi = tl.minimum(k_lo + kps, K)
+    if PDL:
+        # weights don't depend on the previous kernel: start pulling the head of this
+        # program's slice into L2 while that kernel drains, then wait for x.
+        if TRIG == 0:
+            _gdc_launch()
+        if PF > 0:
+            pk = tl.minimum(k_lo + tl.arange(0, PF) * 64, k_hi - 1)
+            _l2_prefetch(w_ptr + tl.minimum(rn, N - 1)[:, None].to(tl.int64) * K + pk[None, :])
+        _gdc_wait()
     acc = tl.zeros([BM, BN], tl.float32)
     for k in range(k_lo, k_hi, BK):
         rk = k + tl.arange(0, BK)
@@ -266,6 +407,8 @@ def _gemv_kernel(
         w = tl.load(w_ptr + rn[None, :] * K + rk[:, None], mask=nm[None, :] & km[:, None], other=0.0,
                     cache_modifier=CM, eviction_policy=EV)
         acc = tl.dot(x, w, acc)
+    if PDL and TRIG > 0:
+        _gdc_launch()
     if FINAL:
         tl.store(out_ptr + rm[:, None] * stride_om + rn[None, :], acc.to(out_ptr.dtype.element_ty),
                  mask=mm[:, None] & nm[None, :])
@@ -288,7 +431,8 @@ def _splitk_reduce_kernel(ws_ptr, out_ptr, n, SK: tl.constexpr, BLOCK: tl.conste
 def _gemv_silu_kernel(
     x_ptr, w_ptr, out_ptr, M, N, K,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-    CM: tl.constexpr = "", EV: tl.constexpr = "",
+    CM: tl.constexpr = "", EV: tl.constexpr = "", PDL: tl.constexpr = False, PF: tl.constexpr = 16,
+    TRIG: tl.constexpr = 0,
 ):
     # w is [2N, K] = gate rows then up rows: out[:, n] = silu(x@wg_n) * (x@wu_n),
     # rounded to bf16 at the same points as silu_mul(linear(x, w)).
@@ -297,6 +441,15 @@ def _gemv_silu_kernel(
     rm = tl.arange(0, BM)
     mm = rm < M
     nm = rn < N
+    if PDL:
+        if TRIG == 0:
+            _gdc_launch()
+        if PF > 0:
+            pk = tl.arange(0, PF) * 64
+            rc = tl.minimum(rn, N - 1)[:, None].to(tl.int64)
+            _l2_prefetch(w_ptr + rc * K + pk[None, :])
+            _l2_prefetch(w_ptr + (rc + N) * K + pk[None, :])
+        _gdc_wait()
     accg = tl.zeros([BM, BN], tl.float32)
     accu = tl.zeros([BM, BN], tl.float32)
     for k in range(0, K, BK):
@@ -309,6 +462,8 @@ def _gemv_silu_kernel(
                      cache_modifier=CM, eviction_policy=EV)
         accg = tl.dot(x, wg, accg)
         accu = tl.dot(x, wu, accu)
+    if PDL and TRIG > 0:
+        _gdc_launch()
     dt = out_ptr.dtype.element_ty
     g = accg.to(dt).to(tl.float32)
     u = accu.to(dt).to(tl.float32)
@@ -320,9 +475,13 @@ def _gemv_silu_kernel(
 @triton.jit
 def _reduce_add_rms_kernel(
     ws_ptr, h_ptr, w_ptr, hn_ptr, y_ptr, M, n_cols, eps,
-    SK: tl.constexpr, BLOCK: tl.constexpr,
+    SK: tl.constexpr, BLOCK: tl.constexpr, PDL: tl.constexpr = False, TRIG: tl.constexpr = 0,
 ):
     # one program per row: hn = h + bf16(sum_splits ws); y = rmsnorm(hn) * w
+    if PDL:
+        if TRIG < 2:
+            _gdc_launch()
+        _gdc_wait()
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
     m = cols < n_cols
@@ -353,10 +512,15 @@ GEMM_CFG = {
 SILU_CFG = {(9728, 2560): (32, 128, 3, 2)}
 
 
+PF = int(os.environ.get("ENGINE_PF", "4"))
+TRIG = int(os.environ.get("ENGINE_TRIG", "1"))
+
+
 class TritonOps:
     def __init__(self, e):
         self.e = e
         assert e.hd & (e.hd - 1) == 0 and e.hd >= 2
+        _probe_pdl()
         self.dummy_pos = torch.zeros(1, dtype=torch.long, device=e.dev)
 
     def _rms_launch(self, h, d, w, has_add):
@@ -393,12 +557,13 @@ class TritonOps:
             )
             return q.transpose(1, 2)
         q = torch.empty((B, e.nh, S, e.hd), dtype=qkv.dtype, device=qkv.device)
-        _qkv_post_kernel[(B * S, e.nh + 2 * e.nkv)](
+        _launch(
+            _qkv_post_kernel, (B * S, e.nh + 2 * e.nkv),
             qkv.contiguous(), l.qn, l.kn, e.cos, e.sin,
             pos if pos is not None else self.dummy_pos,
             q, kc, vc, S, kc.shape[2], e.eps,
             NH=e.nh, NKV=e.nkv, HD=e.hd, DECODE=pos is not None,
-            POS_STRIDE=1 if (pos is not None and pos.numel() > 1) else 0, num_warps=1,
+            POS_STRIDE=1 if (pos is not None and pos.numel() > 1) else 0, num_warps=1, PDL=PDL, TRIG=TRIG,
         )
         return q
 
@@ -414,14 +579,16 @@ class TritonOps:
             nsplit *= 2
         ws = torch.empty((bk * W * G, nsplit, e.hd + 2), dtype=torch.float32, device=q.device)
         out = torch.empty((B * W, e.nh * e.hd), dtype=q.dtype, device=q.device)
-        _attn_split_kernel[(bk, nsplit)](
+        _launch(
+            _attn_split_kernel, (bk, nsplit),
             q, kc, vc, pos, ws, kc.shape[2], e.hd ** -0.5,
             NSPLIT=nsplit, G=G, W=W, GP=max(16, triton.next_power_of_2(W * G)), HD=e.hd,
             BLOCK_N=64, NKV=e.nkv, POS_STRIDE=1 if pos.numel() > 1 else 0,
-            num_warps=4, num_stages=2,
+            num_warps=4, num_stages=2, PDL=PDL, TRIG=TRIG,
         )
-        _attn_combine_kernel[(bk * W * G,)](
-            ws, out, NSPLIT=nsplit, SP=nsplit, HD=e.hd, NKV=e.nkv, G=G, W=W, num_warps=1
+        _launch(
+            _attn_combine_kernel, (bk * W * G,),
+            ws, out, NSPLIT=nsplit, SP=nsplit, HD=e.hd, NKV=e.nkv, G=G, W=W, num_warps=1, PDL=PDL, TRIG=TRIG,
         )
         return out
 
@@ -435,15 +602,17 @@ class TritonOps:
         kps = triton.cdiv(triton.cdiv(K, SK), BK) * BK
         out = torch.empty((M, N), dtype=x.dtype, device=x.device)
         if SK == 1:
-            _gemv_kernel[(triton.cdiv(N, BN), 1)](
+            _launch(
+                _gemv_kernel, (triton.cdiv(N, BN), 1),
                 x, w, out, M, N, K, kps, N,
-                BM=16, BN=BN, BK=BK, FINAL=True, num_warps=NW, num_stages=ST,
+                BM=16, BN=BN, BK=BK, FINAL=True, num_warps=NW, num_stages=ST, PDL=PDL, PF=PF, TRIG=TRIG,
             )
             return out
         ws = torch.empty((SK, M, N), dtype=torch.float32, device=x.device)
-        _gemv_kernel[(triton.cdiv(N, BN), SK)](
+        _launch(
+            _gemv_kernel, (triton.cdiv(N, BN), SK),
             x, w, ws, M, N, K, kps, N,
-            BM=16, BN=BN, BK=BK, FINAL=False, num_warps=NW, num_stages=ST,
+            BM=16, BN=BN, BK=BK, FINAL=False, num_warps=NW, num_stages=ST, PDL=PDL, PF=PF, TRIG=TRIG,
         )
         _splitk_reduce_kernel[(triton.cdiv(M * N, 1024),)](ws, out, M * N, SK=SK, BLOCK=1024)
         return out
@@ -457,8 +626,9 @@ class TritonOps:
             return self.silu_mul(self.linear(x, wgu))
         BN, BK, ST, NW = cfg
         out = torch.empty((M, I), dtype=x.dtype, device=x.device)
-        _gemv_silu_kernel[(triton.cdiv(I, BN),)](
-            x, wgu, out, M, I, K, BM=16, BN=BN, BK=BK, num_warps=NW, num_stages=ST,
+        _launch(
+            _gemv_silu_kernel, (triton.cdiv(I, BN),),
+            x, wgu, out, M, I, K, BM=16, BN=BN, BK=BK, num_warps=NW, num_stages=ST, PDL=PDL, PF=PF, TRIG=TRIG,
         )
         return out
 
@@ -472,14 +642,16 @@ class TritonOps:
         BN, BK, SK, ST, NW = cfg
         kps = triton.cdiv(triton.cdiv(K, SK), BK) * BK
         ws = torch.empty((SK, M, N), dtype=torch.float32, device=x.device)
-        _gemv_kernel[(triton.cdiv(N, BN), SK)](
+        _launch(
+            _gemv_kernel, (triton.cdiv(N, BN), SK),
             x, w, ws, M, N, K, kps, N,
-            BM=16, BN=BN, BK=BK, FINAL=False, num_warps=NW, num_stages=ST,
+            BM=16, BN=BN, BK=BK, FINAL=False, num_warps=NW, num_stages=ST, PDL=PDL, PF=PF, TRIG=TRIG,
         )
         hn = torch.empty_like(h)
         y = torch.empty_like(h)
-        _reduce_add_rms_kernel[(M,)](
+        _launch(
+            _reduce_add_rms_kernel, (M,),
             ws, h, lnw, hn, y, M, N, self.e.eps,
-            SK=SK, BLOCK=triton.next_power_of_2(N), num_warps=8 if SK >= 4 else 4,
+            SK=SK, BLOCK=triton.next_power_of_2(N), num_warps=8 if SK >= 4 else 4, PDL=PDL, TRIG=TRIG,
         )
         return hn, y
