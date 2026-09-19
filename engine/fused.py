@@ -543,6 +543,7 @@ SILU_CFG = {(9728, 2560): (32, 128, 3, 2)}
 
 EVEN_K = os.environ.get("ENGINE_EVENK", "1") != "0"  # mask-free GEMV when the shape divides evenly
 ATTN_TARGET = int(os.environ.get("ENGINE_ATTN_TARGET", "256"))
+ATTN_TARGET_BIG = int(os.environ.get("ENGINE_ATTN_TARGET_BIG", "128"))
 ATTN_ST = int(os.environ.get("ENGINE_ATTN_ST", "3"))
 PF = int(os.environ.get("ENGINE_PF", "4"))
 TRIG = int(os.environ.get("ENGINE_TRIG", "1"))
@@ -607,7 +608,8 @@ class TritonOps:
         B = q.shape[0]
         bk = B * e.nkv
         nsplit = 1
-        while bk * nsplit < ATTN_TARGET and nsplit < 32:  # CTA target for the split-KV grid
+        target = ATTN_TARGET_BIG if bk >= 128 else ATTN_TARGET  # big grids: one wave, nsplit=1 skips the combine
+        while bk * nsplit < target and nsplit < 32:
             nsplit *= 2
         out = torch.empty((B * W, e.nh * e.hd), dtype=q.dtype, device=q.device)
         final = nsplit == 1  # nothing to combine: the split kernel normalises and stores
