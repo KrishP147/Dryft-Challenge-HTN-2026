@@ -378,7 +378,7 @@ def _gemv_kernel(
     x_ptr, w_ptr, out_ptr, M, N, K, kps, stride_om,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, FINAL: tl.constexpr,
     CM: tl.constexpr = "", EV: tl.constexpr = "", PDL: tl.constexpr = False, PF: tl.constexpr = 16,
-    TRIG: tl.constexpr = 0,
+    TRIG: tl.constexpr = 0, EVENK: tl.constexpr = False,
 ):
     # skinny GEMM: out[M, N] = x[M, K] @ w[N, K]^T, M <= BM (16). Each program owns
     # BN rows of w and one K-slice (split-K). Bandwidth-bound: w is read once.
@@ -400,13 +400,22 @@ def _gemv_kernel(
             _l2_prefetch(w_ptr + tl.minimum(rn, N - 1)[:, None].to(tl.int64) * K + pk[None, :])
         _gdc_wait()
     acc = tl.zeros([BM, BN], tl.float32)
-    for k in range(k_lo, k_hi, BK):
-        rk = k + tl.arange(0, BK)
-        km = rk < k_hi
-        x = tl.load(x_ptr + rm[:, None] * K + rk[None, :], mask=mm[:, None] & km[None, :], other=0.0)
-        w = tl.load(w_ptr + rn[None, :] * K + rk[:, None], mask=nm[None, :] & km[:, None], other=0.0,
-                    cache_modifier=CM, eviction_policy=EV)
-        acc = tl.dot(x, w, acc)
+    if EVENK:
+        # N % BN == 0 and every K split is a whole number of BK tiles: no K/N masks, so the
+        # loads along K can be fully vectorised (16-byte cp.async).
+        for k in range(k_lo, k_lo + kps, BK):
+            rk = tl.max_contiguous(tl.multiple_of(k + tl.arange(0, BK), BK), BK)
+            x = tl.load(x_ptr + rm[:, None] * K + rk[None, :], mask=mm[:, None], other=0.0)
+            w = tl.load(w_ptr + rn[None, :] * K + rk[:, None], cache_modifier=CM, eviction_policy=EV)
+            acc = tl.dot(x, w, acc)
+    else:
+        for k in range(k_lo, k_hi, BK):
+            rk = k + tl.arange(0, BK)
+            km = rk < k_hi
+            x = tl.load(x_ptr + rm[:, None] * K + rk[None, :], mask=mm[:, None] & km[None, :], other=0.0)
+            w = tl.load(w_ptr + rn[None, :] * K + rk[:, None], mask=nm[None, :] & km[:, None], other=0.0,
+                        cache_modifier=CM, eviction_policy=EV)
+            acc = tl.dot(x, w, acc)
     if PDL and TRIG > 0:
         _gdc_launch()
     if FINAL:
@@ -432,7 +441,7 @@ def _gemv_silu_kernel(
     x_ptr, w_ptr, out_ptr, M, N, K,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
     CM: tl.constexpr = "", EV: tl.constexpr = "", PDL: tl.constexpr = False, PF: tl.constexpr = 16,
-    TRIG: tl.constexpr = 0,
+    TRIG: tl.constexpr = 0, EVENK: tl.constexpr = False,
 ):
     # w is [2N, K] = gate rows then up rows: out[:, n] = silu(x@wg_n) * (x@wu_n),
     # rounded to bf16 at the same points as silu_mul(linear(x, w)).
@@ -452,18 +461,27 @@ def _gemv_silu_kernel(
         _gdc_wait()
     accg = tl.zeros([BM, BN], tl.float32)
     accu = tl.zeros([BM, BN], tl.float32)
-    for k in range(0, K, BK):
-        rk = k + tl.arange(0, BK)
-        km = rk < K
-        x = tl.load(x_ptr + rm[:, None] * K + rk[None, :], mask=mm[:, None] & km[None, :], other=0.0)
-        wg = tl.load(w_ptr + rn[None, :] * K + rk[:, None], mask=nm[None, :] & km[:, None], other=0.0,
-                     cache_modifier=CM, eviction_policy=EV)
-        wu = tl.load(w_ptr + (rn[None, :] + N) * K + rk[:, None], mask=nm[None, :] & km[:, None], other=0.0,
-                     cache_modifier=CM, eviction_policy=EV)
-        accg = tl.dot(x, wg, accg)
-        accu = tl.dot(x, wu, accu)
-    if PDL and TRIG > 0:
-        _gdc_launch()
+    if EVENK:
+        for k in range(0, K, BK):
+            rk = tl.max_contiguous(tl.multiple_of(k + tl.arange(0, BK), BK), BK)
+            x = tl.load(x_ptr + rm[:, None] * K + rk[None, :], mask=mm[:, None], other=0.0)
+            wg = tl.load(w_ptr + rn[None, :] * K + rk[:, None], cache_modifier=CM, eviction_policy=EV)
+            wu = tl.load(w_ptr + (rn[None, :] + N) * K + rk[:, None], cache_modifier=CM, eviction_policy=EV)
+            accg = tl.dot(x, wg, accg)
+            accu = tl.dot(x, wu, accu)
+    else:
+        for k in range(0, K, BK):
+            rk = k + tl.arange(0, BK)
+            km = rk < K
+            x = tl.load(x_ptr + rm[:, None] * K + rk[None, :], mask=mm[:, None] & km[None, :], other=0.0)
+            wg = tl.load(w_ptr + rn[None, :] * K + rk[:, None], mask=nm[None, :] & km[:, None], other=0.0,
+                         cache_modifier=CM, eviction_policy=EV)
+            wu = tl.load(w_ptr + (rn[None, :] + N) * K + rk[:, None], mask=nm[None, :] & km[:, None], other=0.0,
+                         cache_modifier=CM, eviction_policy=EV)
+            accg = tl.dot(x, wg, accg)
+            accu = tl.dot(x, wu, accu)
+        if PDL and TRIG > 0:
+            _gdc_launch()
     dt = out_ptr.dtype.element_ty
     g = accg.to(dt).to(tl.float32)
     u = accu.to(dt).to(tl.float32)
@@ -512,6 +530,7 @@ GEMM_CFG = {
 SILU_CFG = {(9728, 2560): (32, 128, 3, 2)}
 
 
+EVEN_K = os.environ.get("ENGINE_EVENK", "1") != "0"  # mask-free GEMV when the shape divides evenly
 PF = int(os.environ.get("ENGINE_PF", "4"))
 TRIG = int(os.environ.get("ENGINE_TRIG", "1"))
 
@@ -600,19 +619,20 @@ class TritonOps:
             return torch.nn.functional.linear(x, w)
         BN, BK, SK, ST, NW = cfg
         kps = triton.cdiv(triton.cdiv(K, SK), BK) * BK
+        even = EVEN_K and N % BN == 0 and kps * SK == K
         out = torch.empty((M, N), dtype=x.dtype, device=x.device)
         if SK == 1:
             _launch(
                 _gemv_kernel, (triton.cdiv(N, BN), 1),
                 x, w, out, M, N, K, kps, N,
-                BM=16, BN=BN, BK=BK, FINAL=True, num_warps=NW, num_stages=ST, PDL=PDL, PF=PF, TRIG=TRIG,
+                BM=16, BN=BN, BK=BK, FINAL=True, num_warps=NW, num_stages=ST, PDL=PDL, PF=PF, TRIG=TRIG, EVENK=even,
             )
             return out
         ws = torch.empty((SK, M, N), dtype=torch.float32, device=x.device)
         _launch(
             _gemv_kernel, (triton.cdiv(N, BN), SK),
             x, w, ws, M, N, K, kps, N,
-            BM=16, BN=BN, BK=BK, FINAL=False, num_warps=NW, num_stages=ST, PDL=PDL, PF=PF, TRIG=TRIG,
+            BM=16, BN=BN, BK=BK, FINAL=False, num_warps=NW, num_stages=ST, PDL=PDL, PF=PF, TRIG=TRIG, EVENK=even,
         )
         _splitk_reduce_kernel[(triton.cdiv(M * N, 1024),)](ws, out, M * N, SK=SK, BLOCK=1024)
         return out
@@ -625,10 +645,12 @@ class TritonOps:
         if cfg is None or M > 16 or not x.is_contiguous():
             return self.silu_mul(self.linear(x, wgu))
         BN, BK, ST, NW = cfg
+        even = EVEN_K and I % BN == 0 and K % BK == 0
         out = torch.empty((M, I), dtype=x.dtype, device=x.device)
         _launch(
             _gemv_silu_kernel, (triton.cdiv(I, BN),),
             x, wgu, out, M, I, K, BM=16, BN=BN, BK=BK, num_warps=NW, num_stages=ST, PDL=PDL, PF=PF, TRIG=TRIG,
+            EVENK=even,
         )
         return out
 
@@ -641,11 +663,12 @@ class TritonOps:
             return self.add_rms(h, self.linear(x, w), lnw)
         BN, BK, SK, ST, NW = cfg
         kps = triton.cdiv(triton.cdiv(K, SK), BK) * BK
+        even = EVEN_K and N % BN == 0 and kps * SK == K
         ws = torch.empty((SK, M, N), dtype=torch.float32, device=x.device)
         _launch(
             _gemv_kernel, (triton.cdiv(N, BN), SK),
             x, w, ws, M, N, K, kps, N,
-            BM=16, BN=BN, BK=BK, FINAL=False, num_warps=NW, num_stages=ST, PDL=PDL, PF=PF, TRIG=TRIG,
+            BM=16, BN=BN, BK=BK, FINAL=False, num_warps=NW, num_stages=ST, PDL=PDL, PF=PF, TRIG=TRIG, EVENK=even,
         )
         hn = torch.empty_like(h)
         y = torch.empty_like(h)
