@@ -59,13 +59,25 @@ def _rope_half(a, b, ca, cb, sa, sb, DT: tl.constexpr):
 @triton.jit
 def _qkv_post_kernel(
     qkv_ptr, qn_ptr, kn_ptr, cos_ptr, sin_ptr, pos_ptr,
-    q_ptr, kc_ptr, vc_ptr, S, cap, eps,
-    NH: tl.constexpr, NKV: tl.constexpr, HD: tl.constexpr, DECODE: tl.constexpr,
+    q_ptr, kc_ptr, vc_ptr, B, S, cap, eps,
+    NH: tl.constexpr, NKV: tl.constexpr, HD: tl.constexpr,
+    DECODE: tl.constexpr, LAST_QUERY_ONLY: tl.constexpr,
 ):
-    # one program per (token, head): q/k get qk-norm + rope, v is copied; k/v go
-    # straight into the static cache, q into [B, NH, S, HD].
-    t = tl.program_id(0)
-    hidx = tl.program_id(1)
+    # The last-layer prefill has one Q per batch item but K/V for every token.
+    # Other paths use one program per (token, head).
+    if LAST_QUERY_ONLY:
+        pid = tl.program_id(0)
+        if pid < B * NH:
+            b = pid // NH
+            hidx = pid % NH
+            t = b * S + S - 1
+        else:
+            kv = pid - B * NH
+            t = kv // (2 * NKV)
+            hidx = NH + kv % (2 * NKV)
+    else:
+        t = tl.program_id(0)
+        hidx = tl.program_id(1)
     b = t // S
     s = t % S
     DT: tl.constexpr = q_ptr.dtype.element_ty
@@ -95,7 +107,10 @@ def _qkv_post_kernel(
         s2 = tl.load(sin_ptr + cb + HALF + offs)
         o1, o2 = _rope_half(n1, n2, c1, c2, s1, s2, DT)
         if hidx < NH:
-            qo = q_ptr + ((b * NH + hidx) * S + s) * HD
+            if LAST_QUERY_ONLY:
+                qo = q_ptr + (b * NH + hidx) * HD
+            else:
+                qo = q_ptr + ((b * NH + hidx) * S + s) * HD
             tl.store(qo + offs, o1)
             tl.store(qo + HALF + offs, o2)
         else:
@@ -259,14 +274,18 @@ class TritonOps:
         _silu_mul_kernel[(triton.cdiv(n, 1024),)](gu, out, n, inter, BLOCK=1024)
         return out
 
-    def qkv_post(self, qkv, l, kc, vc, B, S, pos):
+    def qkv_post(self, qkv, l, kc, vc, B, S, pos, last_query_only=False):
         e = self.e
-        q = torch.empty((B, e.nh, S, e.hd), dtype=qkv.dtype, device=qkv.device)
-        _qkv_post_kernel[(B * S, e.nh + 2 * e.nkv)](
+        q_len = 1 if last_query_only else S
+        q = torch.empty((B, e.nh, q_len, e.hd), dtype=qkv.dtype, device=qkv.device)
+        grid = ((B * e.nh + B * S * 2 * e.nkv,) if last_query_only
+                else (B * S, e.nh + 2 * e.nkv))
+        _qkv_post_kernel[grid](
             qkv.contiguous(), l.qn, l.kn, e.cos, e.sin,
             pos if pos is not None else self.dummy_pos,
-            q, kc, vc, S, kc.shape[2], e.eps,
-            NH=e.nh, NKV=e.nkv, HD=e.hd, DECODE=pos is not None, num_warps=1,
+            q, kc, vc, B, S, kc.shape[2], e.eps,
+            NH=e.nh, NKV=e.nkv, HD=e.hd, DECODE=pos is not None,
+            LAST_QUERY_ONLY=last_query_only, num_warps=1,
         )
         return q
 

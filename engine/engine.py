@@ -71,16 +71,20 @@ class _TorchOps:
             q.reshape(B, e.nkv, e.nh // e.nkv, e.hd), kc, vc, attn_mask=mask
         ).reshape(B, e.nh * e.hd)
 
-    def qkv_post(self, qkv, l, kc, vc, B, S, pos):
+    def qkv_post(self, qkv, l, kc, vc, B, S, pos, last_query_only=False):
         e = self.e
         nh, nkv, hd = e.nh, e.nkv, e.hd
         q, k, v = qkv.split([nh * hd, nkv * hd, nkv * hd], -1)
-        q = _rms(q.reshape(B, S, nh, hd), l.qn, e.eps).transpose(1, 2)
+        q = q.reshape(B, S, nh, hd)
+        if last_query_only:
+            q = q[:, -1:, :, :]
+        q = _rms(q, l.qn, e.eps).transpose(1, 2)
         k = _rms(k.reshape(B, S, nkv, hd), l.kn, e.eps).transpose(1, 2)
         v = v.reshape(B, S, nkv, hd).transpose(1, 2)
         if pos is None:
             cos, sin = e.cos[:S], e.sin[:S]
-            q, k = _rope(q, cos, sin), _rope(k, cos, sin)
+            qcos, qsin = (cos[-1:], sin[-1:]) if last_query_only else (cos, sin)
+            q, k = _rope(q, qcos, qsin), _rope(k, cos, sin)
             kc[:, :, :S] = k
             vc[:, :, :S] = v
         else:
@@ -219,14 +223,17 @@ class Engine:
         last = self.L - 1
         for i, l in enumerate(self.layers):
             kc, vc = st.kc[i], st.vc[i]
-            q = ops.qkv_post(ops.linear(a, l.wqkv), l, kc, vc, B, S, pos)
+            q = ops.qkv_post(
+                ops.linear(a, l.wqkv), l, kc, vc, B, S, pos,
+                last_query_only=not decode and i == last,
+            )
             if decode:
                 o = ops.attn_decode(q, kc, vc, pos)
             elif i == last:
                 # The final layer only contributes the last prompt position's
                 # logits. Its last query can attend to every cached key.
                 o = F.scaled_dot_product_attention(
-                    q[:, :, -1:, :], kc[:, :, :S], vc[:, :, :S], enable_gqa=True
+                    q, kc[:, :, :S], vc[:, :, :S], enable_gqa=True
                 ).transpose(1, 2).reshape(B, nh * hd)
                 h = h[S - 1::S].contiguous()
             else:

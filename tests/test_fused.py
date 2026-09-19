@@ -43,19 +43,26 @@ close("silu_mul", tri.silu_mul(gu), tor.silu_mul(gu))
 l = _Layer()
 l.qn = torch.randn(HD, device=dev, dtype=bf)
 l.kn = torch.randn(HD, device=dev, dtype=bf)
-for B, S, pos, cap in [
-    (2, 6, None, 16),
-    (3, 1, torch.tensor([9], device=dev), 16),
-    (3, 1, torch.tensor([63], device=dev), 64),
+for B, S, pos, cap, last_query_only in [
+    (2, 6, None, 16, False),
+    (2, 6, None, 16, True),
+    (3, 1, torch.tensor([9], device=dev), 16, False),
+    (3, 1, torch.tensor([63], device=dev), 64, False),
 ]:
     qkv = torch.randn(B * S, (NH + 2 * NKV) * HD, device=dev, dtype=bf)
     out = {}
     for name, ops in (("torch", tor), ("triton", tri)):
         kc = torch.zeros(B, NKV, cap, HD, device=dev, dtype=bf)
         vc = torch.zeros_like(kc)
-        q = ops.qkv_post(qkv, l, kc, vc, B, S, pos)
+        q = ops.qkv_post(qkv, l, kc, vc, B, S, pos,
+                         last_query_only=last_query_only)
         out[name] = (q, kc, vc)
-    tag = f"B{B} S{S} {'dec' if pos is not None else 'pre'}"
+    tag = f"B{B} S{S} {'dec' if pos is not None else 'pre'} last={last_query_only}"
     for i, n in enumerate(("q", "k", "v")):
         close(f"qkv_post {tag} {n}", out["triton"][i], out["torch"][i])
+    if last_query_only:
+        kc = torch.zeros(B, NKV, cap, HD, device=dev, dtype=bf)
+        vc = torch.zeros_like(kc)
+        full_q = tor.qkv_post(qkv, l, kc, vc, B, S, pos)
+        close("last query vs full q", out["triton"][0], full_q[:, :, -1:, :])
 print("all OK")

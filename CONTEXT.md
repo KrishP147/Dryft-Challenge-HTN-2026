@@ -32,7 +32,7 @@ Only `engine/` is submitted. Keep notes/tools/tokens outside it.
 
 ## Engine design (what's in there)
 - **v1**: torch ops, static KV cache (`B x nkv x cap x hd`, cap rounded to 128), decode captured in a CUDA graph per `(B, cap)` (max 6 cached states), D2H copy + event per step so `yield` of step t-1 overlaps GPU step t. Prefill uses SDPA causal; only last token per seq goes to lm_head. Fused wqkv and gate|up weights.
-- **Current prefill**: the final layer computes attention for each sequence's last query only; that query attends to all prompt keys.
+- **Current prefill**: the final layer normalizes/rotates/stores each sequence's last query only, while caching every key and value; that query attends to all prompt keys.
 - **v2** (`fused.py`): Triton fused add+rmsnorm, qk-norm+rope+KV write, silu*up. Mirrors ref bf16 rounding points.
 - **v3**: split-KV Triton decode attention (+combine kernel), reads `pos` from a device tensor (graph-safe).
 - **v4**: Triton split-K skinny GEMM for decode linears when M<=16; falls to `F.linear` for unlisted shapes / M>16 (`GEMM_CFG` in fused.py).
