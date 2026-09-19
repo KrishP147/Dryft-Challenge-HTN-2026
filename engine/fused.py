@@ -480,6 +480,6 @@ class TritonOps:
         y = torch.empty_like(h)
         _reduce_add_rms_kernel[(M,)](
             ws, h, lnw, hn, y, M, N, self.e.eps,
-            SK=SK, BLOCK=triton.next_power_of_2(N), num_warps=4,
+            SK=SK, BLOCK=triton.next_power_of_2(N), num_warps=8 if SK >= 4 else 4,
         )
         return hn, y
