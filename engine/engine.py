@@ -1,6 +1,6 @@
 """Qwen3-4B greedy decode engine: static KV cache, CUDA-graphed decode, pipelined host sync.
 
-v1: pure PyTorch (no Triton). CPU path verified vs HF; GPU path untested.
+v2: fused Triton ops (fused.py) with load-time selftest + torch fallback.
 """
 import glob
 import json
@@ -8,6 +8,12 @@ import os
 
 import torch
 import torch.nn.functional as F
+
+try:
+    from fused import TritonOps
+except Exception as _e:  # no triton / import failure: torch ops only
+    TritonOps = None
+    _FUSED_ERR = repr(_e)
 
 CAP_GRAN = 128
 MAX_STATES = 6
@@ -23,6 +29,50 @@ def _rms(x, w, eps):
 def _rope(x, cos, sin):
     h = x.shape[-1] // 2
     return x * cos + torch.cat((-x[..., h:], x[..., :h]), -1) * sin
+
+
+def _build_rope_tables(theta, hd, n, dev, dtype):
+    inv = 1.0 / (theta ** (torch.arange(0, hd, 2, device=dev).float() / hd))
+    fr = torch.outer(torch.arange(n, device=dev).float(), inv)
+    emb = torch.cat((fr, fr), -1)
+    return emb.cos().to(dtype), emb.sin().to(dtype)
+
+
+class _TorchOps:
+    """Reference-arithmetic ops; also the fallback when fused ops fail."""
+
+    def __init__(self, e):
+        self.e = e
+
+    def rms(self, h, w):
+        return _rms(h, w, self.e.eps)
+
+    def add_rms(self, h, d, w):
+        h = h + d
+        return h, _rms(h, w, self.e.eps)
+
+    def silu_mul(self, gu):
+        g, u = gu.chunk(2, -1)
+        return F.silu(g) * u
+
+    def qkv_post(self, qkv, l, kc, vc, B, S, pos):
+        e = self.e
+        nh, nkv, hd = e.nh, e.nkv, e.hd
+        q, k, v = qkv.split([nh * hd, nkv * hd, nkv * hd], -1)
+        q = _rms(q.reshape(B, S, nh, hd), l.qn, e.eps).transpose(1, 2)
+        k = _rms(k.reshape(B, S, nkv, hd), l.kn, e.eps).transpose(1, 2)
+        v = v.reshape(B, S, nkv, hd).transpose(1, 2)
+        if pos is None:
+            cos, sin = e.cos[:S], e.sin[:S]
+            q, k = _rope(q, cos, sin), _rope(k, cos, sin)
+            kc[:, :, :S] = k
+            vc[:, :, :S] = v
+        else:
+            cos, sin = e.cos.index_select(0, pos), e.sin.index_select(0, pos)
+            q, k = _rope(q, cos, sin), _rope(k, cos, sin)
+            kc.index_copy_(2, pos, k)
+            vc.index_copy_(2, pos, v)
+        return q
 
 
 class _Layer:
@@ -48,7 +98,11 @@ class Engine:
         self._load(model_path)
         self._build_rope(ROPE_LEN)
         self.states = {}
+        self._dbg = None
+        self.ops = _TorchOps(self)
         self.pool = torch.cuda.graph_pool_handle() if self.dev.type == "cuda" else None
+        if self.dev.type == "cuda":
+            self._selftest()
 
     # ---------------------------------------------------------------- weights
     def _load(self, model_path):
@@ -81,19 +135,13 @@ class Engine:
         del w
 
     def _build_rope(self, n):
-        inv = 1.0 / (
-            self.theta ** (torch.arange(0, self.hd, 2, device=self.dev).float() / self.hd)
-        )
-        fr = torch.outer(torch.arange(n, device=self.dev).float(), inv)
-        emb = torch.cat((fr, fr), -1)
-        self.cos = emb.cos().to(self.dtype)
-        self.sin = emb.sin().to(self.dtype)
+        self.cos, self.sin = _build_rope_tables(self.theta, self.hd, n, self.dev, self.dtype)
 
     # ------------------------------------------------------------------ state
-    def _state(self, B, cap):
+    def _state(self, B, cap, graph=True):
         key = (B, cap)
         st = self.states.get(key)
-        if st is not None:
+        if st is not None and (st.tried_graph or not graph):
             return st
         if len(self.states) >= MAX_STATES:
             del self.states[next(iter(self.states))]
@@ -109,9 +157,10 @@ class Engine:
         st.pos = torch.zeros(1, dtype=torch.long, device=self.dev)
         st.ar = torch.arange(cap, device=self.dev)
         st.graph = None
+        st.tried_graph = graph
         st.hcap = 0
         self.states[key] = st
-        if self.dev.type == "cuda":
+        if graph and self.dev.type == "cuda":
             try:
                 self._capture(st)
             except Exception as e:  # fall back to eager decode
@@ -142,58 +191,89 @@ class Engine:
         torch.cuda.synchronize()
 
     # --------------------------------------------------------------- forwards
-    def _prefill(self, ids, st):
-        B, S = ids.shape
-        nh, nkv, hd = self.nh, self.nkv, self.hd
-        h = self.embed[ids]
-        cos, sin = self.cos[:S], self.sin[:S]
+    def _forward(self, st, tokens, S, pos):
+        """One pass over B*S tokens. pos=None: prefill from position 0 (logits
+        for each sequence's last token only). pos=tensor: one decode step."""
+        B = st.B
+        T = B * S
+        nh, nkv, hd, ops = self.nh, self.nkv, self.hd, self.ops
+        decode = pos is not None
+        h = self.embed[tokens]
+        a = ops.rms(h, self.layers[0].ln1)
+        if decode:
+            mask = (
+                torch.zeros(st.cap, dtype=self.dtype, device=self.dev)
+                .masked_fill_(st.ar > pos, float("-inf"))
+                .view(1, 1, 1, st.cap)
+            )
+        last = self.L - 1
         for i, l in enumerate(self.layers):
-            a = _rms(h, l.ln1, self.eps)
-            q, k, v = F.linear(a, l.wqkv).split([nh * hd, nkv * hd, nkv * hd], -1)
-            q = _rms(q.view(B, S, nh, hd), l.qn, self.eps).transpose(1, 2)
-            k = _rms(k.view(B, S, nkv, hd), l.kn, self.eps).transpose(1, 2)
-            v = v.view(B, S, nkv, hd).transpose(1, 2)
-            q = _rope(q, cos, sin)
-            k = _rope(k, cos, sin)
-            st.kc[i][:, :, :S] = k
-            st.vc[i][:, :, :S] = v
-            o = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
-            h = h + F.linear(o.transpose(1, 2).reshape(B, S, nh * hd), l.wo)
-            a = _rms(h, l.ln2, self.eps)
-            g, u = F.linear(a, l.wgu).chunk(2, -1)
-            h = h + F.linear(F.silu(g) * u, l.wd)
-        h = _rms(h[:, -1], self.norm, self.eps)
-        st.tok.copy_(F.linear(h, self.lm_head).argmax(-1))
+            kc, vc = st.kc[i], st.vc[i]
+            q = ops.qkv_post(F.linear(a, l.wqkv), l, kc, vc, B, S, pos)
+            if decode:
+                # GQA as q_len=group: [B, nkv, nh//nkv, hd] attends to [B, nkv, cap, hd]
+                o = F.scaled_dot_product_attention(
+                    q.reshape(B, nkv, nh // nkv, hd), kc, vc, attn_mask=mask
+                ).reshape(B, nh * hd)
+            else:
+                o = F.scaled_dot_product_attention(
+                    q, kc[:, :, :S], vc[:, :, :S], is_causal=True, enable_gqa=True
+                ).transpose(1, 2).reshape(T, nh * hd)
+                if i == last:  # only each sequence's last token feeds the head
+                    idx = torch.arange(1, B + 1, device=self.dev) * S - 1
+                    o, h = o[idx], h[idx]
+            h, a = ops.add_rms(h, F.linear(o, l.wo), l.ln2)
+            m = ops.silu_mul(F.linear(a, l.wgu))
+            nxt = self.layers[i + 1].ln1 if i < last else self.norm
+            h, a = ops.add_rms(h, F.linear(m, l.wd), nxt)
+        logits = F.linear(a, self.lm_head)
+        if self._dbg is not None:
+            self._dbg.append(logits.float().cpu())
+        return logits.argmax(-1)
+
+    def _prefill(self, ids, st):
+        st.tok.copy_(self._forward(st, ids.reshape(-1), ids.shape[1], None))
 
     def _decode_body(self, st):
-        B, cap = st.B, st.cap
-        nh, nkv, hd = self.nh, self.nkv, self.hd
-        h = self.embed[st.tok]
-        cos = self.cos.index_select(0, st.pos)
-        sin = self.sin.index_select(0, st.pos)
-        mask = (
-            torch.zeros(cap, dtype=self.dtype, device=self.dev)
-            .masked_fill_(st.ar > st.pos, float("-inf"))
-            .view(1, 1, 1, cap)
-        )
-        for i, l in enumerate(self.layers):
-            a = _rms(h, l.ln1, self.eps)
-            q, k, v = F.linear(a, l.wqkv).split([nh * hd, nkv * hd, nkv * hd], -1)
-            q = _rope(_rms(q.reshape(B, nh, hd), l.qn, self.eps), cos, sin)
-            k = _rope(_rms(k.reshape(B, nkv, hd), l.kn, self.eps), cos, sin)
-            st.kc[i].index_copy_(2, st.pos, k.unsqueeze(2))
-            st.vc[i].index_copy_(2, st.pos, v.reshape(B, nkv, 1, hd))
-            # GQA as q_len=group: [B, nkv, nh//nkv, hd] attends to [B, nkv, cap, hd]
-            o = F.scaled_dot_product_attention(
-                q.reshape(B, nkv, nh // nkv, hd), st.kc[i], st.vc[i], attn_mask=mask
-            )
-            h = h + F.linear(o.reshape(B, nh * hd), l.wo)
-            a = _rms(h, l.ln2, self.eps)
-            g, u = F.linear(a, l.wgu).chunk(2, -1)
-            h = h + F.linear(F.silu(g) * u, l.wd)
-        h = _rms(h, self.norm, self.eps)
-        st.tok.copy_(F.linear(h, self.lm_head).argmax(-1))
+        st.tok.copy_(self._forward(st, st.tok, 1, st.pos))
         st.pos.add_(1)
+
+    def _selftest(self):
+        """Fused ops vs torch ops on the real weights; keep fused only if close."""
+        if TritonOps is None:
+            print(f"[engine] fused ops unavailable: {_FUSED_ERR}")
+            return
+        torch.manual_seed(0)
+        B, S, n = 2, 96, 4
+        ids = torch.randint(100, 5000, (B, S), device=self.dev)
+        run = {}
+        for name, ops in (("torch", _TorchOps(self)), ("fused", None)):
+            try:
+                self.ops = ops or TritonOps(self)
+                st = self._state(B, 128, graph=False)
+                self._dbg, toks, steps = [], [], []
+                st.pos.fill_(S)
+                self._prefill(ids, st)
+                for t in range(n):
+                    toks.append(st.tok.clone())
+                    if t < n - 1:
+                        if name == "fused":  # teacher-force the reference tokens
+                            st.tok.copy_(run["torch"][1][t])
+                        self._decode_body(st)
+                run[name] = (self._dbg, toks)
+            except Exception as e:
+                print(f"[engine] fused selftest error: {e!r}")
+                self.ops = _TorchOps(self)
+                self._dbg = None
+                self.states.clear()
+                return
+            finally:
+                self._dbg = None
+                self.states.clear()
+        ref, got = run["torch"][0], run["fused"][0]
+        diff = max((r - g).abs().max().item() for r, g in zip(ref, got))
+        print(f"[engine] fused selftest max logit diff {diff:.4f}")
+        self.ops = TritonOps(self) if diff <= 0.5 else _TorchOps(self)
 
     # --------------------------------------------------------------- generate
     @torch.inference_mode()
