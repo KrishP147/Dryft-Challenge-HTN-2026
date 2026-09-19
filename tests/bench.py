@@ -26,6 +26,7 @@ ap.add_argument("--corpus", default="pydoc", choices=["pydoc", "code", "repeat"]
 args = ap.parse_args()
 
 from engine import Engine  # noqa: E402
+from score_model import predict, roofline_pct  # noqa: E402
 
 t0 = time.time()
 eng = Engine(args.model)
@@ -78,6 +79,7 @@ def run(ids, n):
 baseline = None
 worst = {}
 results = []
+by_shape = {}
 for spec in args.shapes:
     B, S, n = map(int, spec.split(","))
     run(prompts(B, S, 0), n)  # warmup, same shape
@@ -98,10 +100,11 @@ for spec in args.shapes:
     mem = torch.cuda.max_memory_allocated() / 2**30
     print(
         f"B{B} {S}->{n}: {tps:8.1f} tok/s  total {med*1e3:7.1f} ms  ttft {statistics.median(tf)*1e3:6.1f} ms  "
-        f"tpot {tpot*1e3:5.2f} ms  spread {spread*100:4.1f}%  mem {mem:.1f} GiB",
+        f"tpot {tpot*1e3:5.2f} ms  spread {spread*100:4.1f}%  mem {mem:.1f} GiB  roofline {roofline_pct(B, S, n, tpot*1e3)[0]:.0f}%",
         flush=True,
     )
     results.append(tps)
+    by_shape[(B, S, n)] = tps
 
     if not args.no_check:
         if baseline is None:
@@ -129,3 +132,6 @@ gm = 1.0
 for r in results:
     gm *= r
 print(f"geomean(public) {gm ** (1 / len(results)):.1f} tok/s")
+pub = [by_shape.get(k) for k in ((1, 512, 32), (4, 2048, 32), (16, 512, 128))]
+if all(pub):
+    print(f"predicted official score {predict(*pub):.1f} (score_model.py; best so far 1042.4)")

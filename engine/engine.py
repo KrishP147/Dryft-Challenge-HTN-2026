@@ -21,7 +21,7 @@ SPEC = os.environ.get("ENGINE_SPEC", "0") == "1"  # exact n-gram speculation, B=
 SPEC_W_MAX = 7  # verify width: 1 known token + up to 6 n-gram drafts
 SPEC_ROWS = 16  # max B*W rows through the skinny GEMVs
 MAX_STATES = 6
-ROPE_LEN = 8192
+ROPE_LEN = 32768  # tables for cap <= this are built once; growing past it rebuilds them and drops the graphs
 
 
 def _rms(x, w, eps):
@@ -209,6 +209,17 @@ class Engine:
         self.cos, self.sin = _build_rope_tables(self.theta, self.hd, n, self.dev, self.dtype)
 
     # ------------------------------------------------------------------ state
+    def _grow_rope(self, cap):
+        """Positions beyond the tables: rebuild them. Graphs baked the old table addresses, so drop
+        them and start a fresh mempool (reusing the old pool after deleting its graphs trips a
+        CUDACachingAllocator assert on the next capture)."""
+        self.states.clear()
+        if self.dev.type == "cuda":
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            self.pool = torch.cuda.graph_pool_handle()
+        self._build_rope(cap)
+
     def _state(self, B, cap, graph=True, W=1):
         key = (B, cap, W)
         st = self.states.get(key)
@@ -436,8 +447,7 @@ class Engine:
             return
         cap = -(-(S + n) // CAP_GRAN) * CAP_GRAN
         if cap > self.cos.shape[0]:
-            self.states.clear()
-            self._build_rope(cap)
+            self._grow_rope(cap)
         st = self._state(B, cap)
         self._host_bufs(st, n)
         ids = torch.tensor(input_ids, dtype=torch.long, device=self.dev)
@@ -472,8 +482,7 @@ class Engine:
         K = W - 1
         cap = -(-(S + n + W) // CAP_GRAN) * CAP_GRAN
         if cap > self.cos.shape[0]:
-            self.states.clear()
-            self._build_rope(cap)
+            self._grow_rope(cap)
         st = self._state(B, cap, W=W)
         ids = torch.tensor(input_ids, dtype=torch.long, device=self.dev)
         self._prefill(ids, st)  # async

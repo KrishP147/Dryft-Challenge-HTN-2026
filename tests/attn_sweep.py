@@ -13,8 +13,10 @@ def t(fn):
     s.record()
     for _ in range(5): g.replay()
     e.record(); torch.cuda.synchronize(); return s.elapsed_time(e) / 5 * 1e3
-for B, L, cap in ((1, 544, 640), (4, 2080, 2176), (16, 640, 640), (16, 128, 256)):
-    NL = 12 if B * cap > 20000 else 36
+import ast
+SHAPES = ast.literal_eval(sys.argv[1]) if len(sys.argv) > 1 else ((1, 544, 640), (4, 2080, 2176), (16, 640, 640), (16, 128, 256))
+for B, L, cap in SHAPES:
+    NL = 6 if B * cap > 60000 else (12 if B * cap > 20000 else 36)
     kcs = [torch.randn(B, NKV, cap, HD, device="cuda", dtype=bf) for _ in range(NL)]; vcs = [torch.randn_like(kcs[0]) for _ in range(NL)]
     q = torch.randn(B, NKV, 1, G, HD, device="cuda", dtype=bf); pos = torch.tensor([L - 1], device="cuda")
     bk = B * NKV; gb = 2 * B * NKV * L * HD * 2 / 1e9
