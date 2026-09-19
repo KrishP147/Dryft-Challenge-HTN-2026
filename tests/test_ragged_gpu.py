@@ -39,6 +39,6 @@ with tempfile.TemporaryDirectory() as model_dir:
     one_token = [1, 2, 3, 4, 5, 6]
     assert len(list(engine.generate([one_token], 1))) == 1
     cap = -(-(len(one_token) + 1) // CAP_GRAN) * CAP_GRAN
-    assert engine.states[(1, cap, len(one_token))].graph is None
+    assert engine.states[(1, cap, 1, len(one_token), False)].graph is None
 
 print("ragged interleaving and single-token graph skip OK")

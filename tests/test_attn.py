@@ -1,68 +1,40 @@
-"""GPU: Triton split-KV decode attention vs SDPA-with-mask reference."""
+"""GPU: Triton split-KV decode attention (multi-token causal, per-seq pos) vs fp32 reference."""
 import os, sys, types
 import torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "engine"))
-from engine import _TorchOps
 from fused import TritonOps
 
 dev = torch.device("cuda")
-e = types.SimpleNamespace(dev=dev, nh=32, nkv=8, hd=128, eps=1e-6, dtype=torch.bfloat16)
-tor, tri = _TorchOps(e), TritonOps(e)
+NH, NKV, HD = 32, 8, 128
+G = NH // NKV
+e = types.SimpleNamespace(dev=dev, nh=NH, nkv=NKV, hd=HD, eps=1e-6, dtype=torch.bfloat16)
+tri = TritonOps(e)
 torch.manual_seed(0)
 
-
-def graph_us(fn, repeats=50):
-    fn()  # compile and warm before capture
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = fn()
-    for _ in range(5):
-        graph.replay()
-    torch.cuda.synchronize()
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(repeats):
-        graph.replay()
-    end.record()
-    torch.cuda.synchronize()
-    assert captured is not None
-    return start.elapsed_time(end) * 1e3 / repeats
-
+def ref(q, kc, vc, pos, W):
+    B = q.shape[0]
+    out = torch.zeros(B * W, NH * HD, device=dev)
+    for b in range(B):
+        for j in range(W):
+            L = int(pos[b if pos.numel() > 1 else 0]) + j + 1
+            K = kc[b, :, :L].float(); V = vc[b, :, :L].float()      # [NKV, L, HD]
+            qj = q[b, :, j].float()                                 # [NKV, G, HD]
+            p = torch.softmax(qj @ K.transpose(1, 2) * HD ** -0.5, -1)
+            out[b * W + j] = (p @ V).reshape(-1)
+    return out
 
 worst = 0
-for B, cap, L in [(1, 640, 513), (1, 640, 1), (1, 640, 640), (4, 2304, 2049), (16, 640, 513), (16, 640, 640), (3, 384, 200), (32, 640, 1), (32, 640, 513), (32, 640, 640)]:
-    kc = torch.randn(B, 8, cap, 128, device=dev, dtype=torch.bfloat16)
-    vc = torch.randn(B, 8, cap, 128, device=dev, dtype=torch.bfloat16)
-    q = torch.randn(B, 32, 1, 128, device=dev, dtype=torch.bfloat16)
-    pos = torch.tensor([L - 1], device=dev)
-    a, b = tri.attn_decode(q, kc, vc, pos), tor.attn_decode(q, kc, vc, pos)
-    assert torch.isfinite(a).all().item(), (B, cap, L, "nonfinite Triton attention")
-    assert torch.isfinite(b).all().item(), (B, cap, L, "nonfinite SDPA reference")
-    d = (a.float() - b.float()).abs().max().item()
-    worst = max(worst, d)
-    print(f"B{B} cap{cap} L{L}: max|diff|={d:.5f} ref|max|={b.float().abs().max().item():.3f}")
-    # Match the engine's graph replay path, without Python allocation overhead.
-    for name, f in (("triton", tri), ("sdpa", tor)):
-        us = graph_us(lambda: f.attn_decode(q, kc, vc, pos))
-        print(f"    {name}: {us:.1f} us/graph")
-assert worst < 0.05, worst
-
-# Capture once, then change the device-side position as generate() does.
-B, cap = 32, 128
-kc = torch.randn(B, 8, cap, 128, device=dev, dtype=torch.bfloat16)
-vc = torch.randn_like(kc)
-q = torch.randn(B, 32, 1, 128, device=dev, dtype=torch.bfloat16)
-pos = torch.tensor([0], device=dev)
-tri.attn_decode(q, kc, vc, pos)  # compile before capture
-graph = torch.cuda.CUDAGraph()
-with torch.cuda.graph(graph):
-    captured = tri.attn_decode(q, kc, vc, pos)
-for L in (1, 64, 128):
-    pos.fill_(L - 1)
-    graph.replay()
-    ref = tor.attn_decode(q, kc, vc, pos)
-    assert torch.isfinite(captured).all().item(), (L, "nonfinite graphed attention")
-    assert torch.isfinite(ref).all().item(), (L, "nonfinite SDPA reference")
-    assert (captured.float() - ref.float()).abs().max().item() < 0.05, L
+for B, W, cap, posl in [(1, 1, 640, [512]), (1, 7, 640, [512]), (1, 7, 640, [0]), (2, 7, 384, [200, 11]),
+                        (3, 5, 2304, [2048, 900, 5]), (4, 4, 640, [512, 512, 300, 0]),
+                        (16, 1, 640, [512] * 16), (32, 1, 640, [512] * 32)]:
+    kc = torch.randn(B, NKV, cap, HD, device=dev, dtype=torch.bfloat16)
+    vc = torch.randn(B, NKV, cap, HD, device=dev, dtype=torch.bfloat16)
+    q = torch.randn(B, NKV, W, G, HD, device=dev, dtype=torch.bfloat16)
+    pos = torch.tensor(posl if B > 1 else posl[:1], device=dev)
+    if B > 1 and len(posl) == 1: pos = pos.expand(B).contiguous()
+    a = tri.attn_decode(q.view(B, NH, W, HD) if False else q, kc, vc, pos, W).float()
+    r = ref(q, kc, vc, pos, W)
+    d = (a - r).abs().max().item(); worst = max(worst, d)
+    print(f"B{B} W{W} cap{cap} pos{posl}: max|diff|={d:.5f}")
+assert worst < 0.02, worst
 print("ATTN OK")

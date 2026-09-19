@@ -6,6 +6,7 @@ the full engine correctness suite still requires PyTorch and model weights.
 import ctypes as c
 import importlib.machinery
 import math
+import os
 import struct
 import sys
 import types
@@ -15,10 +16,13 @@ from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
 torch_stub = types.ModuleType("torch")
+os.environ["ENGINE_PDL"] = "0"
 torch_stub.__spec__ = importlib.machinery.ModuleSpec("torch", None)
 sys.modules["torch"] = torch_stub
 sys.path.insert(0, "engine")
-from fused import _add_rms_kernel, _qkv_post_kernel, _silu_mul_kernel  # noqa: E402
+from fused import (  # noqa: E402
+    _add_rms_kernel, _attn_split_kernel, _qkv_post_prefill_kernel, _silu_mul_kernel,
+)
 
 
 def check(code, operation):
@@ -154,10 +158,10 @@ call("cuModuleUnload", module)
 B, S, CAP, NH, NKV, HD = 2, 3, 8, 4, 2, 8
 TOTAL = (NH + 2 * NKV) * HD
 source = ASTSource(
-    _qkv_post_kernel,
-    {**{i: "*bf16" for i in range(9)}, 5: "*i64",
-     9: "i32", 10: "i32", 11: "i32", 12: "fp32"},
-    {13: NH, 14: NKV, 15: HD, 16: False, 17: True},
+    _qkv_post_prefill_kernel,
+    {**{i: "*bf16" for i in range(8)},
+     8: "i32", 9: "i32", 10: "fp32"},
+    {11: NH, 12: NKV, 13: HD, 14: True},
 )
 kernel = triton.compile(source, target=GPUTarget("cuda", sm, 32),
                         options={"num_warps": 1, "num_stages": 1})
@@ -172,24 +176,22 @@ host_qn = (c.c_uint16 * HD)(*(bf16(1.0) for _ in range(HD)))
 host_kn = (c.c_uint16 * HD)(*(bf16(1.0) for _ in range(HD)))
 host_cos = (c.c_uint16 * (S * HD))(*(bf16(1.0) for _ in range(S * HD)))
 host_sin = (c.c_uint16 * (S * HD))()
-host_pos = (c.c_int64 * 1)(0)
 host_q = (c.c_uint16 * (B * NH * HD))()
 host_k = (c.c_uint16 * (B * NKV * CAP * HD))()
 host_v = (c.c_uint16 * (B * NKV * CAP * HD))()
-hosts = [host_qkv, host_qn, host_kn, host_cos, host_sin, host_pos,
+hosts = [host_qkv, host_qn, host_kn, host_cos, host_sin,
          host_q, host_k, host_v]
 buffers = [c.c_uint64() for _ in hosts]
 for ptr, buf in zip(buffers, hosts):
     call("cuMemAlloc_v2", c.byref(ptr), c.sizeof(buf))
     call("cuMemcpyHtoD_v2", ptr, buf, c.sizeof(buf))
-arg_b, arg_s, arg_cap, arg_eps = c.c_int(B), c.c_int(S), c.c_int(CAP), c.c_float(EPS)
-args = (c.c_void_p * 13)(*(c.addressof(p) for p in buffers),
-                         c.addressof(arg_b), c.addressof(arg_s),
+arg_s, arg_cap, arg_eps = c.c_int(S), c.c_int(CAP), c.c_float(EPS)
+args = (c.c_void_p * 11)(*(c.addressof(p) for p in buffers),
+                         c.addressof(arg_s),
                          c.addressof(arg_cap), c.addressof(arg_eps))
-grid = B * NH + B * S * 2 * NKV
-call("cuLaunchKernel", function, grid, 1, 1, 32, 1, 1, 0, None, args, None)
+call("cuLaunchKernel", function, B * S, NKV, 1, 32, 1, 1, 0, None, args, None)
 call("cuCtxSynchronize")
-for ptr, buf in zip(buffers[6:], hosts[6:]):
+for ptr, buf in zip(buffers[5:], hosts[5:]):
     call("cuMemcpyDtoH_v2", buf, ptr, c.sizeof(buf))
 
 
@@ -222,6 +224,63 @@ for b in range(B):
                 assert host_k[dst] == 0 and host_v[dst] == 0, ("cache tail", b, h, s, d)
 print(f"Last-query QKV prefill kernel: GPU correctness OK on SM{sm}")
 for ptr in buffers:
+    call("cuMemFree_v2", ptr)
+call("cuModuleUnload", module)
+
+# At NSPLIT=1 the attention kernel writes directly into token-major output.
+# Zero queries/keys give uniform weights; token 0 sees V[0], token 1 their mean.
+B, NKV, G, HD, CAP, W = 2, 2, 4, 32, 32, 2
+source = ASTSource(
+    _attn_split_kernel,
+    {0: "*bf16", 1: "*bf16", 2: "*bf16", 3: "*i64",
+     4: "*bf16", 5: "*bf16", 6: "i32", 7: "fp32"},
+    {8: 1, 9: G, 10: W, 11: 16, 12: HD, 13: 64,
+     14: NKV, 15: 0, 16: False, 17: 0},
+)
+kernel = triton.compile(source, target=GPUTarget("cuda", sm, 32),
+                        options={"num_warps": 4, "num_stages": 2})
+binary = c.create_string_buffer(kernel.asm["cubin"])
+module = c.c_void_p()
+call("cuModuleLoadData", c.byref(module), binary)
+function = c.c_void_p()
+call("cuModuleGetFunction", c.byref(function), module, kernel.metadata.name.encode())
+host_aq = (c.c_uint16 * (B * NKV * W * G * HD))()
+host_ak = (c.c_uint16 * (B * NKV * CAP * HD))()
+host_av = (c.c_uint16 * (B * NKV * CAP * HD))()
+for b in range(B):
+    for h in range(NKV):
+        base = (b + 1) * (h + 1) * 0.25
+        for d in range(HD):
+            host_av[((b * NKV + h) * CAP) * HD + d] = bf16(base)
+            host_av[((b * NKV + h) * CAP + 1) * HD + d] = bf16(3 * base)
+host_ap = (c.c_int64 * 1)(0)
+host_ao = (c.c_uint16 * (B * W * NKV * G * HD))()
+attn_hosts = [host_aq, host_ak, host_av, host_ap, host_ao]
+attn_buffers = [c.c_uint64() for _ in attn_hosts]
+for ptr, buf in zip(attn_buffers, attn_hosts):
+    call("cuMemAlloc_v2", c.byref(ptr), c.sizeof(buf))
+    call("cuMemcpyHtoD_v2", ptr, buf, c.sizeof(buf))
+arg_cap, arg_scale = c.c_int(CAP), c.c_float(HD ** -0.5)
+args = (c.c_void_p * 8)(
+    c.addressof(attn_buffers[0]), c.addressof(attn_buffers[1]),
+    c.addressof(attn_buffers[2]), c.addressof(attn_buffers[3]),
+    c.addressof(attn_buffers[4]), c.addressof(attn_buffers[4]),
+    c.addressof(arg_cap), c.addressof(arg_scale),
+)
+call("cuLaunchKernel", function, B * NKV, 1, 1, 128, 1, 1, kernel.metadata.shared, None, args, None)
+call("cuCtxSynchronize")
+call("cuMemcpyDtoH_v2", host_ao, attn_buffers[4], c.sizeof(host_ao))
+for b in range(B):
+    for h in range(NKV):
+        base = (b + 1) * (h + 1) * 0.25
+        for s in range(W):
+            expected = bf16(base if s == 0 else 2 * base)
+            for g in range(G):
+                for d in range(HD):
+                    idx = ((b * W + s) * NKV * G + h * G + g) * HD + d
+                    assert host_ao[idx] == expected, (b, s, h, g, d)
+print(f"Single-split direct attention: GPU correctness OK on SM{sm}")
+for ptr in attn_buffers:
     call("cuMemFree_v2", ptr)
 call("cuModuleUnload", module)
 call("cuCtxDestroy_v2", ctx)
