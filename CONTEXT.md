@@ -18,7 +18,7 @@ Make Qwen3-4B decode faster on 1x H100, **output unchanged**. Score = geomean to
 engine/engine.py   Engine: weight load, static KV, CUDA-graph decode, pipelined host sync, load-time selftest
 engine/fused.py    Triton kernels + TritonOps (add+rmsnorm, qk-norm+rope+cache write, silu*up, split-KV attn, skinny split-K GEMM)
 tests/bench.py     GPU bench + correctness vs HF baseline (mimics platform)
-tests/prof.py      torch.profiler kernel table for one generate()
+tests/prof.py      torch.profiler kernel table for full generation, prefill, or decode
 tests/test_attn.py GPU: Triton attn vs SDPA
 tests/test_prefill_last_query.py GPU: last-query prefill vs full causal attention
 tests/test_fused.py fused ops vs torch ops on CUDA GPU
@@ -63,9 +63,10 @@ python tests/bench.py --model /workspace/model
 python tests/bench.py --shapes 1,512,32 --no-check       # quick perf only
 # other shapes: "B,S,n" e.g. 8,1024,64
 
-python tests/prof.py 16 512 128                           # kernel profile (MODEL env = model path)
+python tests/prof.py 16 512 128 --phase decode            # decode profile (MODEL env = model path)
+python tests/prof.py 4 2048 32 --phase prefill            # prefill profile
 python tests/test_attn.py                                 # GPU attn vs SDPA
-python tests/test_fused.py                                # GPU, or CPU w/ TRITON_INTERPRET=1 (default)
+python tests/test_fused.py                                # compiled CUDA kernels only
 python tests/test_vs_hf.py                                # CPU, no model needed
 python tests/gemv_bench.py                                # GEMM microbench
 ```
