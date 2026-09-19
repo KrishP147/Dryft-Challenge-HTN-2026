@@ -57,6 +57,59 @@ def _rope_half(a, b, ca, cb, sa, sb, DT: tl.constexpr):
 
 
 @triton.jit
+def _head_norm_rope(x_base, w_ptr, cb, cos_ptr, sin_ptr, offs, eps,
+                    HALF: tl.constexpr, HD: tl.constexpr, DT: tl.constexpr):
+    x1 = tl.load(x_base + offs)
+    x2 = tl.load(x_base + HALF + offs)
+    f1 = x1.to(tl.float32)
+    f2 = x2.to(tl.float32)
+    var = (tl.sum(f1 * f1, axis=0) + tl.sum(f2 * f2, axis=0)) / HD
+    r = tl.math.rsqrt(var + eps)
+    n1 = (f1 * r).to(DT) * tl.load(w_ptr + offs)
+    n2 = (f2 * r).to(DT) * tl.load(w_ptr + HALF + offs)
+    c1 = tl.load(cos_ptr + cb + offs)
+    c2 = tl.load(cos_ptr + cb + HALF + offs)
+    s1 = tl.load(sin_ptr + cb + offs)
+    s2 = tl.load(sin_ptr + cb + HALF + offs)
+    return _rope_half(n1, n2, c1, c2, s1, s2, DT)
+
+
+@triton.jit
+def _qkv_post_prefill_kernel(
+    qkv_ptr, qn_ptr, kn_ptr, cos_ptr, sin_ptr, q_ptr, kc_ptr, vc_ptr, S, cap, eps,
+    NH: tl.constexpr, NKV: tl.constexpr, HD: tl.constexpr,
+):
+    # one program per (token, kv head): its G q heads (qk-norm + rope -> q [T, NH, HD],
+    # token-major so flash attention returns a contiguous [T, NH*HD]), the k head
+    # (norm + rope -> cache) and the v head (copy -> cache).
+    t = tl.program_id(0)
+    kvh = tl.program_id(1)
+    b = t // S
+    s = t % S
+    G: tl.constexpr = NH // NKV
+    HALF: tl.constexpr = HD // 2
+    DT: tl.constexpr = q_ptr.dtype.element_ty
+    offs = tl.arange(0, HALF)
+    TOTAL: tl.constexpr = (NH + 2 * NKV) * HD
+    base = qkv_ptr + t.to(tl.int64) * TOTAL
+    cb = s * HD
+    for g in tl.static_range(G):
+        hq = kvh * G + g
+        o1, o2 = _head_norm_rope(base + hq * HD, qn_ptr, cb, cos_ptr, sin_ptr, offs, eps, HALF, HD, DT)
+        qo = q_ptr + (t.to(tl.int64) * NH + hq) * HD
+        tl.store(qo + offs, o1)
+        tl.store(qo + HALF + offs, o2)
+    o1, o2 = _head_norm_rope(base + (NH + kvh) * HD, kn_ptr, cb, cos_ptr, sin_ptr, offs, eps, HALF, HD, DT)
+    ko = kc_ptr + ((b * NKV + kvh).to(tl.int64) * cap + s) * HD
+    tl.store(ko + offs, o1)
+    tl.store(ko + HALF + offs, o2)
+    vb = base + (NH + NKV + kvh) * HD
+    vo = vc_ptr + ((b * NKV + kvh).to(tl.int64) * cap + s) * HD
+    tl.store(vo + offs, tl.load(vb + offs))
+    tl.store(vo + HALF + offs, tl.load(vb + HALF + offs))
+
+
+@triton.jit
 def _qkv_post_kernel(
     qkv_ptr, qn_ptr, kn_ptr, cos_ptr, sin_ptr, pos_ptr,
     q_ptr, kc_ptr, vc_ptr, S, cap, eps,
@@ -327,6 +380,13 @@ class TritonOps:
 
     def qkv_post(self, qkv, l, kc, vc, B, S, pos):
         e = self.e
+        if pos is None:  # prefill: q token-major [B, S, nh, hd], returned as a [B, nh, S, hd] view
+            q = torch.empty((B, S, e.nh, e.hd), dtype=qkv.dtype, device=qkv.device)
+            _qkv_post_prefill_kernel[(B * S, e.nkv)](
+                qkv.contiguous(), l.qn, l.kn, e.cos, e.sin, q, kc, vc, S, kc.shape[2], e.eps,
+                NH=e.nh, NKV=e.nkv, HD=e.hd, num_warps=1,
+            )
+            return q.transpose(1, 2)
         q = torch.empty((B, e.nh, S, e.hd), dtype=qkv.dtype, device=qkv.device)
         _qkv_post_kernel[(B * S, e.nh + 2 * e.nkv)](
             qkv.contiguous(), l.qn, l.kn, e.cos, e.sin,
