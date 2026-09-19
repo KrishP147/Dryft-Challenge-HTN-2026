@@ -26,7 +26,7 @@ tests/test_selftest_fallback.py GPU: force bad GEMV and verify selective fallbac
 tests/test_linear_precision.py GPU: GEMV dtype/layout fallback
 tests/test_ragged_gpu.py GPU: interleaved ragged groups vs separate groups
 tests/compile_triton_offline.py Linux: compile all fused kernel families for SM90 without GPU execution
-tests/probe_gpu_no_torch.py Linux: run fused SiLU, add+RMSNorm, last-query QKV prefill, direct attention, and split/combine attention on a CUDA GPU through the driver, without PyTorch
+tests/probe_gpu_no_torch.py Linux: run fused SiLU, add+RMSNorm, last-query QKV prefill, direct/split attention, and even-K/masked/split-K GEMV on a CUDA GPU through the driver, without PyTorch
 tests/test_vs_hf.py CPU: engine vs HF greedy on tiny random Qwen3 (fp32)
 tests/gemv_bench.py skinny-GEMM microbench, cuBLAS vs Triton
 ```

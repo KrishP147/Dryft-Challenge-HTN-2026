@@ -22,7 +22,8 @@ sys.modules["torch"] = torch_stub
 sys.path.insert(0, "engine")
 from fused import (  # noqa: E402
     _add_rms_kernel, _attn_combine_kernel, _attn_split_kernel,
-    _qkv_post_prefill_kernel, _silu_mul_kernel,
+    _gemv_kernel, _qkv_post_prefill_kernel, _silu_mul_kernel,
+    _splitk_reduce_kernel,
 )
 
 
@@ -363,4 +364,115 @@ call("cuMemFree_v2", gpu_ws)
 for ptr in attn_buffers:
     call("cuMemFree_v2", ptr)
 call("cuModuleUnload", module)
+
+# A two-row skinny GEMM checks tensor-core row/column mapping and even-K
+# loads. The split-K variant must reproduce the direct accumulator result.
+M, N, K, BM, BN, BK = 2, 32, 64, 16, 32, 32
+host_gx = (c.c_uint16 * (M * K))()
+for row in range(M):
+    host_gx[row * K + row] = bf16(1.0)
+    host_gx[row * K + 32 + row] = bf16(1.0)
+host_gw = (c.c_uint16 * (N * K))()
+for n in range(N):
+    host_gw[n * K] = bf16((n % 4 + 1) * 0.125)
+    host_gw[n * K + 32] = bf16((n % 3 + 1) * 0.0625)
+    host_gw[n * K + 1] = bf16(-(n % 5 + 1) * 0.125)
+    host_gw[n * K + 33] = bf16((n % 2 + 1) * 0.25)
+host_go = (c.c_uint16 * (M * N))()
+gemv_hosts = [host_gx, host_gw, host_go]
+gemv_buffers = [c.c_uint64() for _ in gemv_hosts]
+for ptr, buf in zip(gemv_buffers, gemv_hosts):
+    call("cuMemAlloc_v2", c.byref(ptr), c.sizeof(buf))
+    call("cuMemcpyHtoD_v2", ptr, buf, c.sizeof(buf))
+arg_m, arg_n, arg_k = c.c_int(M), c.c_int(N), c.c_int(K)
+arg_kps, arg_stride = c.c_int(K), c.c_int(N)
+
+
+def gemv_function(final, evenk, bn=BN, bk=BK):
+    source = ASTSource(
+        _gemv_kernel,
+        {0: "*bf16", 1: "*bf16", 2: "*bf16" if final else "*fp32",
+         3: "i32", 4: "i32", 5: "i32", 6: "i32", 7: "i32"},
+        {8: BM, 9: bn, 10: bk, 11: final, 12: "", 13: "",
+         14: False, 15: 4, 16: 0, 17: evenk},
+    )
+    compiled = triton.compile(source, target=GPUTarget("cuda", sm, 32),
+                              options={"num_warps": 4, "num_stages": 2})
+    binary = c.create_string_buffer(compiled.asm["cubin"])
+    loaded = c.c_void_p()
+    call("cuModuleLoadData", c.byref(loaded), binary)
+    func = c.c_void_p()
+    call("cuModuleGetFunction", c.byref(func), loaded, compiled.metadata.name.encode())
+    return loaded, func, compiled.metadata.shared
+
+
+module, function, shared = gemv_function(True, True)
+args = (c.c_void_p * 8)(
+    c.addressof(gemv_buffers[0]), c.addressof(gemv_buffers[1]),
+    c.addressof(gemv_buffers[2]), c.addressof(arg_m),
+    c.addressof(arg_n), c.addressof(arg_k),
+    c.addressof(arg_kps), c.addressof(arg_stride),
+)
+call("cuLaunchKernel", function, 1, 1, 1, 128, 1, 1, shared, None, args, None)
+call("cuCtxSynchronize")
+call("cuMemcpyDtoH_v2", host_go, gemv_buffers[2], c.sizeof(host_go))
+
+
+def check_gemv(label):
+    for row in range(M):
+        for n in range(N):
+            expected = bf16(from_bf16(host_gw[n * K + row]) +
+                            from_bf16(host_gw[n * K + 32 + row]))
+            assert host_go[row * N + n] == expected, (label, row, n)
+
+
+check_gemv("direct")
+print(f"Direct even-K GEMV: GPU correctness OK on SM{sm}")
+call("cuModuleUnload", module)
+
+module, function, shared = gemv_function(True, False, bn=64, bk=128)
+call("cuLaunchKernel", function, 1, 1, 1, 128, 1, 1, shared, None, args, None)
+call("cuCtxSynchronize")
+call("cuMemcpyDtoH_v2", host_go, gemv_buffers[2], c.sizeof(host_go))
+check_gemv("masked")
+print(f"Direct masked GEMV: GPU correctness OK on SM{sm}")
+call("cuModuleUnload", module)
+
+gpu_gws = c.c_uint64()
+call("cuMemAlloc_v2", c.byref(gpu_gws), 2 * M * N * c.sizeof(c.c_float))
+arg_kps = c.c_int(32)
+module, function, shared = gemv_function(False, True)
+args = (c.c_void_p * 8)(
+    c.addressof(gemv_buffers[0]), c.addressof(gemv_buffers[1]),
+    c.addressof(gpu_gws), c.addressof(arg_m),
+    c.addressof(arg_n), c.addressof(arg_k),
+    c.addressof(arg_kps), c.addressof(arg_stride),
+)
+call("cuLaunchKernel", function, 1, 2, 1, 128, 1, 1, shared, None, args, None)
+call("cuCtxSynchronize")
+call("cuModuleUnload", module)
+empty_gemv_output = (c.c_uint16 * (M * N))()
+call("cuMemcpyHtoD_v2", gemv_buffers[2], empty_gemv_output, c.sizeof(empty_gemv_output))
+source = ASTSource(_splitk_reduce_kernel,
+                   {0: "*fp32", 1: "*bf16", 2: "i32"},
+                   {3: 2, 4: 128})
+kernel = triton.compile(source, target=GPUTarget("cuda", sm, 32),
+                        options={"num_warps": 4, "num_stages": 1})
+binary = c.create_string_buffer(kernel.asm["cubin"])
+module = c.c_void_p()
+call("cuModuleLoadData", c.byref(module), binary)
+function = c.c_void_p()
+call("cuModuleGetFunction", c.byref(function), module, kernel.metadata.name.encode())
+arg_count = c.c_int(M * N)
+args = (c.c_void_p * 3)(c.addressof(gpu_gws), c.addressof(gemv_buffers[2]),
+                       c.addressof(arg_count))
+call("cuLaunchKernel", function, 1, 1, 1, 128, 1, 1, kernel.metadata.shared, None, args, None)
+call("cuCtxSynchronize")
+call("cuMemcpyDtoH_v2", host_go, gemv_buffers[2], c.sizeof(host_go))
+check_gemv("split-K")
+print(f"Split-K GEMV and reduction: GPU correctness OK on SM{sm}")
+call("cuModuleUnload", module)
+call("cuMemFree_v2", gpu_gws)
+for ptr in gemv_buffers:
+    call("cuMemFree_v2", ptr)
 call("cuCtxDestroy_v2", ctx)
