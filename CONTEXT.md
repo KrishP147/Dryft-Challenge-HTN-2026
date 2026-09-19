@@ -44,6 +44,9 @@ Only `engine/` is submitted. Keep notes/tools/tokens outside it.
 | v5 | 968.9 (#7) | fused split-K reduce+residual+rmsnorm; silu epilogue in gate/up GEMV |
 | v7 | pending | token-major prefill qkv kernel (no flash-output copy) |
 
+| v13 | 1035.2 | CUDA-graphed small prefills (flat on public shapes, helps short prompts) |
+| v14 | 1042.4 | mask-free GEMV (EVENK) + alignment hints |
+
 Rule of thumb: official score ~= 1.32 x pod `geomean(public)` from `tests/bench.py` (pod numbers reproduce the platform's public shapes within ~1%). Leaders (Sep 19 ~18:30 UTC): 1130 / 1124 / 1113.
 
 ## Findings (what did and did not pay off)
