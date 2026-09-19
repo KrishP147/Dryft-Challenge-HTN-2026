@@ -20,6 +20,7 @@ ap.add_argument("--model", default="/workspace/model")
 ap.add_argument("--shapes", nargs="*", default=["1,512,32", "4,2048,32", "16,512,128"])
 ap.add_argument("--samples", type=int, default=5)
 ap.add_argument("--no-check", action="store_true")
+ap.add_argument("--check-all", action="store_true", help="teacher-forced check on every sample")
 ap.add_argument("--random", action="store_true", help="random-token prompts instead of natural text")
 args = ap.parse_args()
 
@@ -95,18 +96,16 @@ for spec in args.shapes:
             baseline = AutoModelForCausalLM.from_pretrained(
                 args.model, torch_dtype=torch.bfloat16, attn_implementation="sdpa", local_files_only=True
             ).eval().cuda()
-        ids, out = outs[0]
-        toks = torch.tensor(out).T.cuda()  # [B, n]
-        full = torch.cat([torch.tensor(ids).cuda(), toks], 1)[:, :-1]
         worst_gap, bad = 0.0, 0
-        with torch.inference_mode():
-            for b in range(B):
-                logits = baseline(full[b : b + 1], logits_to_keep=n).logits[0].float()  # [n, V]
-                mx = logits.max(-1).values
-                got = logits.gather(-1, toks[b].unsqueeze(-1)).squeeze(-1)
-                gap = (mx - got)
-                worst_gap = max(worst_gap, gap.max().item())
-                bad += (gap > 2.0).sum().item()
+        for ids, out in (outs if args.check_all else outs[:1]):
+            toks = torch.tensor(out).T.cuda()  # [B, n]
+            full = torch.cat([torch.tensor(ids).cuda(), toks], 1)[:, :-1]
+            with torch.inference_mode():
+                for b in range(B):
+                    logits = baseline(full[b : b + 1], logits_to_keep=n).logits[0].float()  # [n, V]
+                    gap = logits.max(-1).values - logits.gather(-1, toks[b].unsqueeze(-1)).squeeze(-1)
+                    worst_gap = max(worst_gap, gap.max().item())
+                    bad += (gap > 2.0).sum().item()
         print(f"   correctness: worst gap {worst_gap:.3f} logits, positions > 2.0: {bad}", flush=True)
         worst[spec] = worst_gap
 

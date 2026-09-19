@@ -246,6 +246,7 @@ def _attn_combine_kernel(
 def _gemv_kernel(
     x_ptr, w_ptr, out_ptr, M, N, K, kps, stride_om,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, FINAL: tl.constexpr,
+    CM: tl.constexpr = "", EV: tl.constexpr = "",
 ):
     # skinny GEMM: out[M, N] = x[M, K] @ w[N, K]^T, M <= BM (16). Each program owns
     # BN rows of w and one K-slice (split-K). Bandwidth-bound: w is read once.
@@ -262,7 +263,8 @@ def _gemv_kernel(
         rk = k + tl.arange(0, BK)
         km = rk < k_hi
         x = tl.load(x_ptr + rm[:, None] * K + rk[None, :], mask=mm[:, None] & km[None, :], other=0.0)
-        w = tl.load(w_ptr + rn[None, :] * K + rk[:, None], mask=nm[None, :] & km[:, None], other=0.0)
+        w = tl.load(w_ptr + rn[None, :] * K + rk[:, None], mask=nm[None, :] & km[:, None], other=0.0,
+                    cache_modifier=CM, eviction_policy=EV)
         acc = tl.dot(x, w, acc)
     if FINAL:
         tl.store(out_ptr + rm[:, None] * stride_om + rn[None, :], acc.to(out_ptr.dtype.element_ty),
@@ -286,6 +288,7 @@ def _splitk_reduce_kernel(ws_ptr, out_ptr, n, SK: tl.constexpr, BLOCK: tl.conste
 def _gemv_silu_kernel(
     x_ptr, w_ptr, out_ptr, M, N, K,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    CM: tl.constexpr = "", EV: tl.constexpr = "",
 ):
     # w is [2N, K] = gate rows then up rows: out[:, n] = silu(x@wg_n) * (x@wu_n),
     # rounded to bf16 at the same points as silu_mul(linear(x, w)).
@@ -300,8 +303,10 @@ def _gemv_silu_kernel(
         rk = k + tl.arange(0, BK)
         km = rk < K
         x = tl.load(x_ptr + rm[:, None] * K + rk[None, :], mask=mm[:, None] & km[None, :], other=0.0)
-        wg = tl.load(w_ptr + rn[None, :] * K + rk[:, None], mask=nm[None, :] & km[:, None], other=0.0)
-        wu = tl.load(w_ptr + (rn[None, :] + N) * K + rk[:, None], mask=nm[None, :] & km[:, None], other=0.0)
+        wg = tl.load(w_ptr + rn[None, :] * K + rk[:, None], mask=nm[None, :] & km[:, None], other=0.0,
+                     cache_modifier=CM, eviction_policy=EV)
+        wu = tl.load(w_ptr + (rn[None, :] + N) * K + rk[:, None], mask=nm[None, :] & km[:, None], other=0.0,
+                     cache_modifier=CM, eviction_policy=EV)
         accg = tl.dot(x, wg, accg)
         accu = tl.dot(x, wu, accu)
     dt = out_ptr.dtype.element_ty
