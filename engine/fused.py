@@ -594,7 +594,7 @@ class TritonOps:
         B = q.shape[0]
         bk = B * e.nkv
         nsplit = 1
-        while bk * nsplit < 256 and nsplit < 32:
+        while bk * nsplit < 128 and nsplit < 32:  # one wave of CTAs (tests/attn_rules.py: -4.7% vs >=256)
             nsplit *= 2
         ws = torch.empty((bk * W * G, nsplit, e.hd + 2), dtype=torch.float32, device=q.device)
         out = torch.empty((B * W, e.nh * e.hd), dtype=q.dtype, device=q.device)
@@ -603,7 +603,7 @@ class TritonOps:
             q, kc, vc, pos, ws, kc.shape[2], e.hd ** -0.5,
             NSPLIT=nsplit, G=G, W=W, GP=max(16, triton.next_power_of_2(W * G)), HD=e.hd,
             BLOCK_N=64, NKV=e.nkv, POS_STRIDE=1 if pos.numel() > 1 else 0,
-            num_warps=4, num_stages=2, PDL=PDL, TRIG=TRIG,
+            num_warps=4, num_stages=3, PDL=PDL, TRIG=TRIG,
         )
         _launch(
             _attn_combine_kernel, (bk * W * G,),

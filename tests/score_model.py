@@ -1,9 +1,9 @@
 """Score model for the Dryft decode benchmark, reverse-engineered from our official runs.
 
 Facts (verified on every run in RUNS):
-  * score * metricMs / 1000 == 506.52223 (constant): official_score = 506.522 / geomean(p50 s over
-    the 6 private workloads), and geomean(batch * output_tokens) over the private set is 506.5
-    (public set: 203), so the private workloads are much heavier than the public ones.
+  * score * metricMs / 1000 == 506.52223 (constant to 15 digits): official score is exactly
+    proportional to 1 / (aggregate p50 time over the private workloads). The aggregate is a WEIGHTED
+    throughput (spec: "weighted_model_throughput"), so no claim is made about the raw token counts.
   * log(score) = C + sum_k W_k * log(public tok/s_k) fits all runs to <1% (least squares below).
     Weights ~ (B1 512->32, B4 2048->32, B16 512->128) = (0.14, 0.45, 0.44): 1% on B1 is worth
     ~0.14% of score, 1% on either bigger regime ~0.45%.

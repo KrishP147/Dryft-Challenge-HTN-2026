@@ -6,12 +6,20 @@ args = ap.parse_args(); B, S, n = map(int, args.shape.split(","))
 M = "/workspace/model"
 torch.backends.cuda.matmul.allow_tf32 = False
 model = AutoModelForCausalLM.from_pretrained(M, torch_dtype=torch.bfloat16, attn_implementation="sdpa", local_files_only=True).eval().cuda()
+_CORPUS = None
 def prompts(seed):
+    global _CORPUS
     r = random.Random(seed * 7919 + B * 31 + S); out = []
-    for _ in range(B):
-        pat = [r.randrange(1000, 100000) for _ in range(r.randrange(3, 40))]
-        out.append((pat * (S // len(pat) + 1))[:S])
-    return out
+    if args.corpus == "repeat":
+        for _ in range(B):
+            pat = [r.randrange(1000, 100000) for _ in range(r.randrange(3, 40))]
+            out.append((pat * (S // len(pat) + 1))[:S])
+        return out
+    if _CORPUS is None:   # same windows as tests/bench.py (pydoc)
+        from transformers import AutoTokenizer
+        import pydoc_data.topics as t
+        _CORPUS = AutoTokenizer.from_pretrained(M)(" ".join(t.topics.values()), add_special_tokens=False)["input_ids"]
+    return [_CORPUS[o:o + S] for o in (r.randrange(0, len(_CORPUS) - S) for _ in range(B))]
 worst, bad = 0.0, 0
 for k in range(args.samples):
     ids = prompts(k + 1)
