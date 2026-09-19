@@ -295,7 +295,7 @@ def _attn_split_kernel(
     q_ptr, k_ptr, v_ptr, pos_ptr, ws_ptr, cap, sm_scale,
     NSPLIT: tl.constexpr, G: tl.constexpr, W: tl.constexpr, GP: tl.constexpr,
     HD: tl.constexpr, BLOCK_N: tl.constexpr, NKV: tl.constexpr, POS_STRIDE: tl.constexpr,
-    PDL: tl.constexpr = False, TRIG: tl.constexpr = 0,
+    PDL: tl.constexpr = False, TRIG: tl.constexpr = 0, FINAL: tl.constexpr = False,
 ):
     if PDL:
         if TRIG < 2:
@@ -338,6 +338,17 @@ def _attn_split_kernel(
         v = tl.load(v_ptr + kv_base + n[:, None] * HD + d[None, :], mask=nm[:, None], other=0.0)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m_i = m_new
+    if FINAL:
+        # NSPLIT == 1: the combine would be max(m)=m, w=exp(0)=1, so o = acc / l_i.
+        # Write the output here and skip the launch (ws_ptr doubles as out).
+        tok = rows // G
+        out_row = ((bk // NKV) * W + tok) * NKV + bk % NKV
+        o = acc / l_i[:, None]
+        tl.store(
+            ws_ptr + ((out_row * G + rows % G) * HD)[:, None] + d[None, :],
+            o.to(ws_ptr.dtype.element_ty), mask=rmask[:, None],
+        )
+        return
     wb = ((bk * (W * G) + rows) * NSPLIT + sp) * (HD + 2)
     tl.store(ws_ptr + wb[:, None] + d[None, :], acc, mask=rmask[:, None])
     tl.store(ws_ptr + wb + HD, m_i, mask=rmask)
@@ -596,19 +607,23 @@ class TritonOps:
         nsplit = 1
         while bk * nsplit < 256 and nsplit < 32:
             nsplit *= 2
-        ws = torch.empty((bk * W * G, nsplit, e.hd + 2), dtype=torch.float32, device=q.device)
         out = torch.empty((B * W, e.nh * e.hd), dtype=q.dtype, device=q.device)
+        final = nsplit == 1  # nothing to combine: the split kernel normalises and stores
+        ws = out if final else torch.empty(
+            (bk * W * G, nsplit, e.hd + 2), dtype=torch.float32, device=q.device
+        )
         _launch(
             _attn_split_kernel, (bk, nsplit),
             q, kc, vc, pos, ws, kc.shape[2], e.hd ** -0.5,
             NSPLIT=nsplit, G=G, W=W, GP=max(16, triton.next_power_of_2(W * G)), HD=e.hd,
             BLOCK_N=64, NKV=e.nkv, POS_STRIDE=1 if pos.numel() > 1 else 0,
-            num_warps=4, num_stages=2, PDL=PDL, TRIG=TRIG,
+            num_warps=4, num_stages=2, PDL=PDL, TRIG=TRIG, FINAL=final,
         )
-        _launch(
-            _attn_combine_kernel, (bk * W * G,),
-            ws, out, NSPLIT=nsplit, SP=nsplit, HD=e.hd, NKV=e.nkv, G=G, W=W, num_warps=1, PDL=PDL, TRIG=TRIG,
-        )
+        if not final:
+            _launch(
+                _attn_combine_kernel, (bk * W * G,),
+                ws, out, NSPLIT=nsplit, SP=nsplit, HD=e.hd, NKV=e.nkv, G=G, W=W, num_warps=1, PDL=PDL, TRIG=TRIG,
+            )
         return out
 
     def linear(self, x, w):
