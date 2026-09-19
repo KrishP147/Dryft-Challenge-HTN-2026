@@ -22,7 +22,7 @@ sys.modules["torch"] = torch_stub
 sys.path.insert(0, "engine")
 from fused import (  # noqa: E402
     _add_rms_kernel, _attn_combine_kernel, _attn_split_kernel,
-    _gemv_kernel, _qkv_post_prefill_kernel, _silu_mul_kernel,
+    _gemv_kernel, _gemv_silu_kernel, _qkv_post_prefill_kernel, _silu_mul_kernel,
     _splitk_reduce_kernel,
 )
 
@@ -473,6 +473,55 @@ check_gemv("split-K")
 print(f"Split-K GEMV and reduction: GPU correctness OK on SM{sm}")
 call("cuModuleUnload", module)
 call("cuMemFree_v2", gpu_gws)
+
+# Gate/up GEMV fuses two matrix products with a BF16 SiLU epilogue. The gate
+# weights above exercise positive and negative inputs; the up half uses a
+# different scale per input row so both halves affect the output.
+host_sw = (c.c_uint16 * (2 * N * K))()
+for i in range(N * K):
+    host_sw[i] = host_gw[i]
+for n in range(N):
+    for row in range(M):
+        up_part = 1.0 if row == 0 else -0.5
+        host_sw[(N + n) * K + row] = bf16(up_part)
+        host_sw[(N + n) * K + 32 + row] = bf16(up_part)
+gpu_sw = c.c_uint64()
+call("cuMemAlloc_v2", c.byref(gpu_sw), c.sizeof(host_sw))
+call("cuMemcpyHtoD_v2", gpu_sw, host_sw, c.sizeof(host_sw))
+source = ASTSource(
+    _gemv_silu_kernel,
+    {0: "*bf16", 1: "*bf16", 2: "*bf16", 3: "i32", 4: "i32", 5: "i32"},
+    {6: BM, 7: BN, 8: BK, 9: "", 10: "", 11: False,
+     12: 4, 13: 0, 14: True},
+)
+kernel = triton.compile(source, target=GPUTarget("cuda", sm, 32),
+                        options={"num_warps": 4, "num_stages": 2})
+binary = c.create_string_buffer(kernel.asm["cubin"])
+module = c.c_void_p()
+call("cuModuleLoadData", c.byref(module), binary)
+function = c.c_void_p()
+call("cuModuleGetFunction", c.byref(function), module, kernel.metadata.name.encode())
+args = (c.c_void_p * 6)(
+    c.addressof(gemv_buffers[0]), c.addressof(gpu_sw),
+    c.addressof(gemv_buffers[2]), c.addressof(arg_m),
+    c.addressof(arg_n), c.addressof(arg_k),
+)
+call("cuLaunchKernel", function, 1, 1, 1, 128, 1, 1, kernel.metadata.shared, None, args, None)
+call("cuCtxSynchronize")
+call("cuMemcpyDtoH_v2", host_go, gemv_buffers[2], c.sizeof(host_go))
+for row in range(M):
+    for n in range(N):
+        gate = from_bf16(bf16(from_bf16(host_sw[n * K + row]) +
+                              from_bf16(host_sw[n * K + 32 + row])))
+        up = from_bf16(bf16(from_bf16(host_sw[(N + n) * K + row]) +
+                            from_bf16(host_sw[(N + n) * K + 32 + row])))
+        silu = from_bf16(bf16(gate / (1.0 + math.exp(-gate))))
+        expected = from_bf16(bf16(silu * up))
+        actual = from_bf16(host_go[row * N + n])
+        assert abs(actual - expected) < 0.02, ("GEMV SiLU", row, n, actual, expected)
+print(f"Fused gate/up GEMV SiLU: GPU correctness OK on SM{sm}")
+call("cuModuleUnload", module)
+call("cuMemFree_v2", gpu_sw)
 for ptr in gemv_buffers:
     call("cuMemFree_v2", ptr)
 call("cuCtxDestroy_v2", ctx)
