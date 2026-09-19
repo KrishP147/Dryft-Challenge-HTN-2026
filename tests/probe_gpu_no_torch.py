@@ -21,7 +21,8 @@ torch_stub.__spec__ = importlib.machinery.ModuleSpec("torch", None)
 sys.modules["torch"] = torch_stub
 sys.path.insert(0, "engine")
 from fused import (  # noqa: E402
-    _add_rms_kernel, _attn_split_kernel, _qkv_post_prefill_kernel, _silu_mul_kernel,
+    _add_rms_kernel, _attn_combine_kernel, _attn_split_kernel,
+    _qkv_post_prefill_kernel, _silu_mul_kernel,
 )
 
 
@@ -299,6 +300,66 @@ for b in range(B):
                     idx = ((b * W + s) * NKV * G + h * G + g) * HD + d
                     assert host_ao[idx] == expected, (b, s, h, g, d)
 print(f"Single-split direct attention: GPU correctness OK on SM{sm}")
+call("cuModuleUnload", module)
+
+# Two splits exercise the log-sum-exp combine. Token 0 masks every key in the
+# second split; token 1 uses both splits and must average their different V's.
+source = ASTSource(
+    _attn_split_kernel,
+    {0: "*bf16", 1: "*bf16", 2: "*bf16", 3: "*i64",
+     4: "*fp32", 5: "*bf16", 6: "i32", 7: "fp32"},
+    {8: 2, 9: G, 10: W, 11: 16, 12: HD, 13: 64,
+     14: NKV, 15: 0, 16: False, 17: 0},
+)
+kernel = triton.compile(source, target=GPUTarget("cuda", sm, 32),
+                        options={"num_warps": 4, "num_stages": 2})
+binary = c.create_string_buffer(kernel.asm["cubin"])
+module = c.c_void_p()
+call("cuModuleLoadData", c.byref(module), binary)
+function = c.c_void_p()
+call("cuModuleGetFunction", c.byref(function), module, kernel.metadata.name.encode())
+gpu_ws = c.c_uint64()
+ws_bytes = B * NKV * W * G * 2 * (HD + 2) * c.sizeof(c.c_float)
+call("cuMemAlloc_v2", c.byref(gpu_ws), ws_bytes)
+args = (c.c_void_p * 8)(
+    c.addressof(attn_buffers[0]), c.addressof(attn_buffers[1]),
+    c.addressof(attn_buffers[2]), c.addressof(attn_buffers[3]),
+    c.addressof(gpu_ws), c.addressof(attn_buffers[4]),
+    c.addressof(arg_cap), c.addressof(arg_scale),
+)
+call("cuLaunchKernel", function, B * NKV, 2, 1, 128, 1, 1, kernel.metadata.shared, None, args, None)
+call("cuCtxSynchronize")
+call("cuModuleUnload", module)
+empty_output = (c.c_uint16 * len(host_ao))()
+call("cuMemcpyHtoD_v2", attn_buffers[4], empty_output, c.sizeof(empty_output))
+
+source = ASTSource(
+    _attn_combine_kernel, {0: "*fp32", 1: "*bf16"},
+    {2: 2, 3: 2, 4: HD, 5: NKV, 6: G, 7: W, 8: False, 9: 0},
+)
+kernel = triton.compile(source, target=GPUTarget("cuda", sm, 32),
+                        options={"num_warps": 1, "num_stages": 1})
+binary = c.create_string_buffer(kernel.asm["cubin"])
+module = c.c_void_p()
+call("cuModuleLoadData", c.byref(module), binary)
+function = c.c_void_p()
+call("cuModuleGetFunction", c.byref(function), module, kernel.metadata.name.encode())
+args = (c.c_void_p * 2)(c.addressof(gpu_ws), c.addressof(attn_buffers[4]))
+call("cuLaunchKernel", function, B * NKV * W * G, 1, 1, 32, 1, 1,
+     kernel.metadata.shared, None, args, None)
+call("cuCtxSynchronize")
+call("cuMemcpyDtoH_v2", host_ao, attn_buffers[4], c.sizeof(host_ao))
+for b in range(B):
+    for h in range(NKV):
+        base = (b + 1) * (h + 1) * 0.25
+        for s in range(W):
+            expected = bf16(base if s == 0 else 2 * base)
+            for g in range(G):
+                for d in range(HD):
+                    idx = ((b * W + s) * NKV * G + h * G + g) * HD + d
+                    assert host_ao[idx] == expected, ("combine", b, s, h, g, d)
+print(f"Split-and-combine attention: GPU correctness OK on SM{sm}")
+call("cuMemFree_v2", gpu_ws)
 for ptr in attn_buffers:
     call("cuMemFree_v2", ptr)
 call("cuModuleUnload", module)
