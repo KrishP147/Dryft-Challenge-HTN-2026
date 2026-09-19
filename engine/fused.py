@@ -212,6 +212,58 @@ def _splitk_reduce_kernel(ws_ptr, out_ptr, n, SK: tl.constexpr, BLOCK: tl.conste
     tl.store(out_ptr + idx, acc.to(out_ptr.dtype.element_ty), mask=m)
 
 
+@triton.jit
+def _gemv_silu_kernel(
+    x_ptr, w_ptr, out_ptr, M, N, K,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    # w is [2N, K] = gate rows then up rows: out[:, n] = silu(x@wg_n) * (x@wu_n),
+    # rounded to bf16 at the same points as silu_mul(linear(x, w)).
+    pid = tl.program_id(0)
+    rn = pid * BN + tl.arange(0, BN)
+    rm = tl.arange(0, BM)
+    mm = rm < M
+    nm = rn < N
+    accg = tl.zeros([BM, BN], tl.float32)
+    accu = tl.zeros([BM, BN], tl.float32)
+    for k in range(0, K, BK):
+        rk = k + tl.arange(0, BK)
+        km = rk < K
+        x = tl.load(x_ptr + rm[:, None] * K + rk[None, :], mask=mm[:, None] & km[None, :], other=0.0)
+        wg = tl.load(w_ptr + rn[None, :] * K + rk[:, None], mask=nm[None, :] & km[:, None], other=0.0)
+        wu = tl.load(w_ptr + (rn[None, :] + N) * K + rk[:, None], mask=nm[None, :] & km[:, None], other=0.0)
+        accg = tl.dot(x, wg, accg)
+        accu = tl.dot(x, wu, accu)
+    dt = out_ptr.dtype.element_ty
+    g = accg.to(dt).to(tl.float32)
+    u = accu.to(dt).to(tl.float32)
+    sg = (g / (1.0 + tl.exp(-g))).to(dt)
+    tl.store(out_ptr + rm[:, None] * N + rn[None, :], (sg.to(tl.float32) * u).to(dt),
+             mask=mm[:, None] & nm[None, :])
+
+
+@triton.jit
+def _reduce_add_rms_kernel(
+    ws_ptr, h_ptr, w_ptr, hn_ptr, y_ptr, M, n_cols, eps,
+    SK: tl.constexpr, BLOCK: tl.constexpr,
+):
+    # one program per row: hn = h + bf16(sum_splits ws); y = rmsnorm(hn) * w
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    m = cols < n_cols
+    acc = tl.zeros([BLOCK], tl.float32)
+    for i in range(SK):
+        acc += tl.load(ws_ptr + (i * M + row) * n_cols + cols, mask=m, other=0.0)
+    hv = tl.load(h_ptr + row * n_cols + cols, mask=m, other=0.0)
+    dt = hv.dtype
+    hn = (hv.to(tl.float32) + acc.to(dt).to(tl.float32)).to(dt)
+    tl.store(hn_ptr + row * n_cols + cols, hn, mask=m)
+    xf = hn.to(tl.float32)
+    var = tl.sum(xf * xf, axis=0) / n_cols
+    normed = xf * tl.math.rsqrt(var + eps)
+    w = tl.load(w_ptr + cols, mask=m, other=0.0)
+    tl.store(y_ptr + row * n_cols + cols, normed.to(dt) * w, mask=m)
+
 # (N, K) -> (BN, BK, SPLIT_K, stages, warps), swept on H100 (tests/gemv_bench.py)
 GEMM_CFG = {
     (6144, 2560): (64, 128, 1, 5, 4),
@@ -220,6 +272,10 @@ GEMM_CFG = {
     (2560, 9728): (32, 128, 4, 4, 4),
     (151936, 2560): (64, 256, 1, 3, 4),
 }
+
+
+# gate/up + silu epilogue tile configs: (BN, BK, stages, warps)
+SILU_CFG = {(9728, 2560): (32, 128, 3, 2)}
 
 
 class TritonOps:
@@ -305,3 +361,39 @@ class TritonOps:
         )
         _splitk_reduce_kernel[(triton.cdiv(M * N, 1024),)](ws, out, M * N, SK=SK, BLOCK=1024)
         return out
+
+    def gate_up_silu(self, x, wgu):
+        """silu(g) * u for [g; u] = x @ wgu^T"""
+        M, K = x.shape
+        I = wgu.shape[0] // 2
+        cfg = SILU_CFG.get((I, K))
+        if cfg is None or M > 16 or not x.is_contiguous():
+            return self.silu_mul(self.linear(x, wgu))
+        BN, BK, ST, NW = cfg
+        out = torch.empty((M, I), dtype=x.dtype, device=x.device)
+        _gemv_silu_kernel[(triton.cdiv(I, BN),)](
+            x, wgu, out, M, I, K, BM=16, BN=BN, BK=BK, num_warps=NW, num_stages=ST,
+        )
+        return out
+
+    def linear_add_norm(self, x, w, h, lnw):
+        """hn = h + x @ w^T ; returns (hn, rmsnorm(hn, lnw))"""
+        M, K = x.shape
+        N = w.shape[0]
+        cfg = GEMM_CFG.get((N, K))
+        if cfg is None or cfg[2] == 1 or M > 16 or not x.is_contiguous() or not h.is_contiguous():
+            return self.add_rms(h, self.linear(x, w), lnw)
+        BN, BK, SK, ST, NW = cfg
+        kps = triton.cdiv(triton.cdiv(K, SK), BK) * BK
+        ws = torch.empty((SK, M, N), dtype=torch.float32, device=x.device)
+        _gemv_kernel[(triton.cdiv(N, BN), SK)](
+            x, w, ws, M, N, K, kps, N,
+            BM=16, BN=BN, BK=BK, FINAL=False, num_warps=NW, num_stages=ST,
+        )
+        hn = torch.empty_like(h)
+        y = torch.empty_like(h)
+        _reduce_add_rms_kernel[(M,)](
+            ws, h, lnw, hn, y, M, N, self.e.eps,
+            SK=SK, BLOCK=triton.next_power_of_2(N), num_warps=4,
+        )
+        return hn, y

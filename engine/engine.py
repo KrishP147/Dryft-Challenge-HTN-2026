@@ -50,9 +50,12 @@ class _TorchOps:
     def rms(self, h, w):
         return _rms(h, w, self.e.eps)
 
-    def add_rms(self, h, d, w):
-        h = h + d
-        return h, _rms(h, w, self.e.eps)
+    def gate_up_silu(self, x, wgu):
+        return self.silu_mul(F.linear(x, wgu))
+
+    def linear_add_norm(self, x, w, h, lnw):
+        h = h + F.linear(x, w)
+        return h, _rms(h, lnw, self.e.eps)
 
     def silu_mul(self, gu):
         g, u = gu.chunk(2, -1)
@@ -228,10 +231,9 @@ class Engine:
                 if i == last:  # only each sequence's last token feeds the head
                     idx = torch.arange(1, B + 1, device=self.dev) * S - 1
                     o, h = o[idx], h[idx]
-            h, a = ops.add_rms(h, ops.linear(o, l.wo), l.ln2)
-            m = ops.silu_mul(ops.linear(a, l.wgu))
-            nxt = self.layers[i + 1].ln1 if i < last else self.norm
-            h, a = ops.add_rms(h, ops.linear(m, l.wd), nxt)
+            h, a = ops.linear_add_norm(o, l.wo, h, l.ln2)
+            m = ops.gate_up_silu(a, l.wgu)
+            h, a = ops.linear_add_norm(m, l.wd, h, self.layers[i + 1].ln1 if i < last else self.norm)
         logits = ops.linear(a, self.lm_head)
         if self._dbg is not None:
             self._dbg.append(logits.float().cpu())
