@@ -23,7 +23,7 @@ sys.path.insert(0, "engine")
 from fused import (  # noqa: E402
     _add_rms_kernel, _attn_combine_kernel, _attn_split_kernel,
     _gemv_kernel, _gemv_silu_kernel, _qkv_post_prefill_kernel, _silu_mul_kernel,
-    _splitk_reduce_kernel,
+    _reduce_add_rms_kernel, _splitk_reduce_kernel,
 )
 
 
@@ -523,5 +523,66 @@ print(f"Fused gate/up GEMV SiLU: GPU correctness OK on SM{sm}")
 call("cuModuleUnload", module)
 call("cuMemFree_v2", gpu_sw)
 for ptr in gemv_buffers:
+    call("cuMemFree_v2", ptr)
+
+# The fused split-K epilogue rounds the split sum to BF16 before residual
+# addition, then rounds the normalized value before applying the RMS weight.
+R_ROWS, R_COLS, R_SK = 2, 7, 2
+host_rws = (c.c_float * (R_SK * R_ROWS * R_COLS))(
+    *((col + 1) * 0.0625 if split == 0 else
+      (1 if col % 2 == 0 else -1) * (row + 1) * 0.03125
+      for split in range(R_SK) for row in range(R_ROWS) for col in range(R_COLS)))
+host_rh = (c.c_uint16 * (R_ROWS * R_COLS))(
+    *(bf16((col - 3) * 0.25 + row * 0.125)
+      for row in range(R_ROWS) for col in range(R_COLS)))
+host_rw = (c.c_uint16 * R_COLS)(*(bf16(0.5 + col * 0.125) for col in range(R_COLS)))
+host_rhn = (c.c_uint16 * (R_ROWS * R_COLS))()
+host_ry = (c.c_uint16 * (R_ROWS * R_COLS))()
+reduce_hosts = [host_rws, host_rh, host_rw, host_rhn, host_ry]
+reduce_buffers = [c.c_uint64() for _ in reduce_hosts]
+for ptr, buf in zip(reduce_buffers, reduce_hosts):
+    call("cuMemAlloc_v2", c.byref(ptr), c.sizeof(buf))
+    call("cuMemcpyHtoD_v2", ptr, buf, c.sizeof(buf))
+source = ASTSource(
+    _reduce_add_rms_kernel,
+    {0: "*fp32", 1: "*bf16", 2: "*bf16", 3: "*bf16", 4: "*bf16",
+     5: "i32", 6: "i32", 7: "fp32"},
+    {8: R_SK, 9: 128, 10: False, 11: 0},
+)
+kernel = triton.compile(source, target=GPUTarget("cuda", sm, 32),
+                        options={"num_warps": 4, "num_stages": 1})
+binary = c.create_string_buffer(kernel.asm["cubin"])
+module = c.c_void_p()
+call("cuModuleLoadData", c.byref(module), binary)
+function = c.c_void_p()
+call("cuModuleGetFunction", c.byref(function), module, kernel.metadata.name.encode())
+arg_rows, arg_cols, arg_eps = c.c_int(R_ROWS), c.c_int(R_COLS), c.c_float(EPS)
+args = (c.c_void_p * 8)(*(c.addressof(ptr) for ptr in reduce_buffers),
+                        c.addressof(arg_rows), c.addressof(arg_cols), c.addressof(arg_eps))
+call("cuLaunchKernel", function, R_ROWS, 1, 1, 128, 1, 1,
+     kernel.metadata.shared, None, args, None)
+call("cuCtxSynchronize")
+call("cuMemcpyDtoH_v2", host_rhn, reduce_buffers[3], c.sizeof(host_rhn))
+call("cuMemcpyDtoH_v2", host_ry, reduce_buffers[4], c.sizeof(host_ry))
+for row in range(R_ROWS):
+    residual = []
+    for col in range(R_COLS):
+        idx = row * R_COLS + col
+        split_sum = sum(host_rws[(split * R_ROWS + row) * R_COLS + col]
+                        for split in range(R_SK))
+        value = from_bf16(bf16(from_bf16(host_rh[idx]) +
+                               from_bf16(bf16(split_sum))))
+        assert host_rhn[idx] == bf16(value), ("reduce residual", row, col)
+        residual.append(value)
+    var = sum(v * v for v in residual) / R_COLS
+    for col, value in enumerate(residual):
+        idx = row * R_COLS + col
+        expected = from_bf16(bf16(from_bf16(bf16(value / math.sqrt(var + EPS))) *
+                                  from_bf16(host_rw[col])))
+        actual = from_bf16(host_ry[idx])
+        assert abs(actual - expected) < 0.02, ("reduce RMS", row, col, actual, expected)
+print(f"Fused split-K reduce/add/RMSNorm: GPU correctness OK on SM{sm}")
+call("cuModuleUnload", module)
+for ptr in reduce_buffers:
     call("cuMemFree_v2", ptr)
 call("cuCtxDestroy_v2", ctx)
