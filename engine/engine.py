@@ -311,7 +311,7 @@ class Engine:
         if cap > self.cos.shape[0]:
             self.states.clear()
             self._build_rope(cap)
-        st = self._state(B, cap, slot=S)
+        st = self._state(B, cap, graph=n > 1, slot=S)
         self._host_bufs(st, n)
         ids = torch.tensor(input_ids, dtype=torch.long, device=self.dev)
         self._prefill(ids, st)

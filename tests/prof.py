@@ -29,7 +29,7 @@ for _ in range(2):
 
 if args.phase != "full":
     cap = -(-(S + n) // CAP_GRAN) * CAP_GRAN
-    st = eng._state(B, cap, slot=S)
+    st = eng._state(B, cap, graph=args.phase == "decode", slot=S)
     ids_device = torch.tensor(ids, dtype=torch.long, device=eng.dev)
     if args.phase == "decode":
         with torch.inference_mode():

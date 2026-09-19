@@ -10,7 +10,7 @@ assert torch.cuda.is_available(), "requires a CUDA GPU"
 assert os.environ.get("TRITON_INTERPRET") != "1", "requires compiled CUDA kernels"
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "engine"))
-from engine import Engine  # noqa: E402
+from engine import CAP_GRAN, Engine  # noqa: E402
 
 torch.manual_seed(0)
 cfg = Qwen3Config(
@@ -36,5 +36,9 @@ with tempfile.TemporaryDirectory() as model_dir:
         expected = [grouped[3][t][0], grouped[4][t][0],
                     grouped[3][t][1], grouped[5][t][0]]
         assert ragged[t] == expected, (t, ragged[t], expected)
+    one_token = [1, 2, 3, 4, 5, 6]
+    assert len(list(engine.generate([one_token], 1))) == 1
+    cap = -(-(len(one_token) + 1) // CAP_GRAN) * CAP_GRAN
+    assert engine.states[(1, cap, len(one_token))].graph is None
 
-print("ragged group interleaving OK")
+print("ragged interleaving and single-token graph skip OK")
