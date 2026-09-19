@@ -100,7 +100,7 @@ for B, L, cap in ((1, 544, 640), (4, 2080, 2176), (16, 640, 640)):
     ws_ref = torch.empty((bk * G, ns, HD + 2), dtype=torch.float32, device="cuda")
     def ref_fn():
         for i in range(NL):
-            fused._attn_split_kernel[(bk, ns)](q, kcs[i], vcs[i], pos, ws_ref, cap, HD ** -0.5, NSPLIT=ns, G=G, W=1, GP=16, HD=HD, BLOCK_N=64, NKV=NKV, POS_STRIDE=0, num_warps=4, num_stages=2)
+            fused._attn_split_kernel[(bk, ns)](q, kcs[i], vcs[i], pos, ws_ref, out, cap, HD ** -0.5, NSPLIT=ns, G=G, W=1, GP=16, HD=HD, BLOCK_N=64, NKV=NKV, POS_STRIDE=0, num_warps=4, num_stages=2)
             fused._attn_combine_kernel[(bk * G,)](ws_ref, out, NSPLIT=ns, SP=ns, HD=HD, NKV=NKV, G=G, W=1, num_warps=1)
     tref = t(ref_fn) / NL
     ref_fn(); ref_out = out.clone()

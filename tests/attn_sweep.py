@@ -22,11 +22,14 @@ for B, L, cap in SHAPES:
     bk = B * NKV; gb = 2 * B * NKV * L * HD * 2 / 1e9
     res = []
     for nsplit, BN, NW, ST in itertools.product((1, 2, 4, 8, 16, 32), (32, 64, 128), (2, 4, 8), (2, 3, 4)):
-        ws = torch.empty((bk * G, nsplit, HD + 2), dtype=torch.float32, device="cuda"); out = torch.empty((B, NH * HD), dtype=bf, device="cuda")
+        out = torch.empty((B, NH * HD), dtype=bf, device="cuda")
+        ws = (out if nsplit == 1 else
+              torch.empty((bk * G, nsplit, HD + 2), dtype=torch.float32, device="cuda"))
         def fn():
             for i in range(NL):
-                fused._attn_split_kernel[(bk, nsplit)](q, kcs[i], vcs[i], pos, ws, cap, HD ** -0.5, NSPLIT=nsplit, G=G, W=1, GP=16, HD=HD, BLOCK_N=BN, NKV=NKV, POS_STRIDE=0, num_warps=NW, num_stages=ST)
-                fused._attn_combine_kernel[(bk * G,)](ws, out, NSPLIT=nsplit, SP=nsplit, HD=HD, NKV=NKV, G=G, W=1, num_warps=1)
+                fused._attn_split_kernel[(bk, nsplit)](q, kcs[i], vcs[i], pos, ws, out, cap, HD ** -0.5, NSPLIT=nsplit, G=G, W=1, GP=16, HD=HD, BLOCK_N=BN, NKV=NKV, POS_STRIDE=0, num_warps=NW, num_stages=ST)
+                if nsplit > 1:
+                    fused._attn_combine_kernel[(bk * G,)](ws, out, NSPLIT=nsplit, SP=nsplit, HD=HD, NKV=NKV, G=G, W=1, num_warps=1)
         try: res.append((t(fn) / NL, (nsplit, BN, NW, ST)))
         except Exception: pass
     res.sort()

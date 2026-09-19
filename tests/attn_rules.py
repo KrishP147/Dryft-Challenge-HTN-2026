@@ -21,7 +21,8 @@ def pow2_at_least(target, bk, cap=32):
 
 
 RULES = {  # name -> f(bk, L) -> (nsplit, BN, NW, ST)
-    "current(>=256,st2)": lambda bk, L: (pow2_at_least(256, bk), 64, 4, 2),
+    "current-v15": lambda bk, L: (1 if bk >= 128 else pow2_at_least(256, bk), 64, 4, 3),
+    "v14(>=256,st2)": lambda bk, L: (pow2_at_least(256, bk), 64, 4, 2),
     "st3 (>=256)": lambda bk, L: (pow2_at_least(256, bk), 64, 4, 3),
     "st3 (>=128)": lambda bk, L: (pow2_at_least(128, bk), 64, 4, 3),
     "st3 (>=64)": lambda bk, L: (pow2_at_least(64, bk), 64, 4, 3),
@@ -55,18 +56,20 @@ for B, L, cap, wgt in SHAPES:
     row = {}
     for name, rule in RULES.items():
         ns, BN, NW, ST = rule(bk, L)
-        ws = torch.empty((bk * G, ns, HD + 2), dtype=torch.float32, device="cuda")
+        ws = (out if ns == 1 else
+              torch.empty((bk * G, ns, HD + 2), dtype=torch.float32, device="cuda"))
 
         def fn():
             for i in range(NL):
-                fused._attn_split_kernel[(bk, ns)](q, kcs[i], vcs[i], pos, ws, cap, HD ** -0.5, NSPLIT=ns, G=G, W=1, GP=16, HD=HD, BLOCK_N=BN, NKV=NKV, POS_STRIDE=0, num_warps=NW, num_stages=ST)
-                fused._attn_combine_kernel[(bk * G,)](ws, out, NSPLIT=ns, SP=ns, HD=HD, NKV=NKV, G=G, W=1, num_warps=1)
+                fused._attn_split_kernel[(bk, ns)](q, kcs[i], vcs[i], pos, ws, out, cap, HD ** -0.5, NSPLIT=ns, G=G, W=1, GP=16, HD=HD, BLOCK_N=BN, NKV=NKV, POS_STRIDE=0, num_warps=NW, num_stages=ST)
+                if ns > 1:
+                    fused._attn_combine_kernel[(bk * G,)](ws, out, NSPLIT=ns, SP=ns, HD=HD, NKV=NKV, G=G, W=1, num_warps=1)
         row[name] = t(fn) / NL
         totals[name] += wgt * row[name]
-    base = row["current(>=256,st2)"]
+    base = row["current-v15"]
     print(f"B{B:2d} L{L}: " + " | ".join(f"{k.split(' ')[0] if False else k}: {v:5.1f}us" for k, v in row.items()), flush=True)
     del kcs, vcs
 print("\nregime-weighted us/layer (lower is better):")
-base = totals["current(>=256,st2)"]
+base = totals["current-v15"]
 for k, v in sorted(totals.items(), key=lambda kv: kv[1]):
     print(f"  {k:28s} {v:7.2f}  ({100 * (base / v - 1):+.1f}% vs current)")
