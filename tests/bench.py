@@ -120,12 +120,15 @@ for spec in args.shapes:
             with torch.inference_mode():
                 for b in range(B):
                     logits = baseline(full[b : b + 1], logits_to_keep=n).logits[0].float()  # [n, V]
+                    assert torch.isfinite(logits).all().item(), (spec, b, "nonfinite baseline logits")
                     gap = logits.max(-1).values - logits.gather(-1, toks[b].unsqueeze(-1)).squeeze(-1)
+                    assert torch.isfinite(gap).all().item(), (spec, b, "nonfinite logit gap")
                     worst_gap = max(worst_gap, gap.max().item())
                     for pos_ in (gap > 2.0).nonzero().flatten().tolist():
                         print(f"   VIOLATION seq {b} step {pos_}/{n}: gap {gap[pos_].item():.3f} emitted {toks[b, pos_].item()} argmax {logits[pos_].argmax().item()}")
                     bad += (gap > 2.0).sum().item()
         print(f"   correctness: worst gap {worst_gap:.3f} logits, positions > 2.0: {bad}", flush=True)
+        assert bad == 0, f"{spec}: {bad} generated tokens exceeded the 2-logit tolerance"
         worst[spec] = worst_gap
 
 gm = 1.0

@@ -195,7 +195,7 @@ def _head_norm_rope(x_base, w_ptr, cb, cos_ptr, sin_ptr, offs, eps,
 @triton.jit
 def _qkv_post_prefill_kernel(
     qkv_ptr, qn_ptr, kn_ptr, cos_ptr, sin_ptr, q_ptr, kc_ptr, vc_ptr, S, cap, eps,
-    NH: tl.constexpr, NKV: tl.constexpr, HD: tl.constexpr,
+    NH: tl.constexpr, NKV: tl.constexpr, HD: tl.constexpr, LAST_QUERY_ONLY: tl.constexpr,
 ):
     # one program per (token, kv head): its G q heads (qk-norm + rope -> q [T, NH, HD],
     # token-major so flash attention returns a contiguous [T, NH*HD]), the k head
@@ -211,12 +211,16 @@ def _qkv_post_prefill_kernel(
     TOTAL: tl.constexpr = (NH + 2 * NKV) * HD
     base = qkv_ptr + t.to(tl.int64) * TOTAL
     cb = s * HD
-    for g in tl.static_range(G):
-        hq = kvh * G + g
-        o1, o2 = _head_norm_rope(base + hq * HD, qn_ptr, cb, cos_ptr, sin_ptr, offs, eps, HALF, HD, DT)
-        qo = q_ptr + (t.to(tl.int64) * NH + hq) * HD
-        tl.store(qo + offs, o1)
-        tl.store(qo + HALF + offs, o2)
+    if not LAST_QUERY_ONLY or s == S - 1:
+        for g in tl.static_range(G):
+            hq = kvh * G + g
+            o1, o2 = _head_norm_rope(base + hq * HD, qn_ptr, cb, cos_ptr, sin_ptr, offs, eps, HALF, HD, DT)
+            if LAST_QUERY_ONLY:
+                qo = q_ptr + (b.to(tl.int64) * NH + hq) * HD
+            else:
+                qo = q_ptr + (t.to(tl.int64) * NH + hq) * HD
+            tl.store(qo + offs, o1)
+            tl.store(qo + HALF + offs, o2)
     o1, o2 = _head_norm_rope(base + (NH + kvh) * HD, kn_ptr, cb, cos_ptr, sin_ptr, offs, eps, HALF, HD, DT)
     ko = kc_ptr + ((b * NKV + kvh).to(tl.int64) * cap + s) * HD
     tl.store(ko + offs, o1)
@@ -292,10 +296,10 @@ def _qkv_post_kernel(
 
 @triton.jit
 def _attn_split_kernel(
-    q_ptr, k_ptr, v_ptr, pos_ptr, ws_ptr, cap, sm_scale,
+    q_ptr, k_ptr, v_ptr, pos_ptr, ws_ptr, out_ptr, cap, sm_scale,
     NSPLIT: tl.constexpr, G: tl.constexpr, W: tl.constexpr, GP: tl.constexpr,
     HD: tl.constexpr, BLOCK_N: tl.constexpr, NKV: tl.constexpr, POS_STRIDE: tl.constexpr,
-    PDL: tl.constexpr = False, TRIG: tl.constexpr = 0, FINAL: tl.constexpr = False,
+    PDL: tl.constexpr = False, TRIG: tl.constexpr = 0,
 ):
     if PDL:
         if TRIG < 2:
@@ -338,21 +342,17 @@ def _attn_split_kernel(
         v = tl.load(v_ptr + kv_base + n[:, None] * HD + d[None, :], mask=nm[:, None], other=0.0)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m_i = m_new
-    if FINAL:
-        # NSPLIT == 1: the combine would be max(m)=m, w=exp(0)=1, so o = acc / l_i.
-        # Write the output here and skip the launch (ws_ptr doubles as out).
-        tok = rows // G
-        out_row = ((bk // NKV) * W + tok) * NKV + bk % NKV
-        o = acc / l_i[:, None]
-        tl.store(
-            ws_ptr + ((out_row * G + rows % G) * HD)[:, None] + d[None, :],
-            o.to(ws_ptr.dtype.element_ty), mask=rmask[:, None],
-        )
-        return
-    wb = ((bk * (W * G) + rows) * NSPLIT + sp) * (HD + 2)
-    tl.store(ws_ptr + wb[:, None] + d[None, :], acc, mask=rmask[:, None])
-    tl.store(ws_ptr + wb + HD, m_i, mask=rmask)
-    tl.store(ws_ptr + wb + HD + 1, l_i, mask=rmask)
+    if NSPLIT == 1:
+        kvh = bk % NKV
+        ob = ((b * W + rows // G) * (NKV * G) + kvh * G + rows % G) * HD
+        tl.store(out_ptr + ob[:, None] + d[None, :],
+                 (acc / l_i[:, None]).to(out_ptr.dtype.element_ty),
+                 mask=rmask[:, None])
+    else:
+        wb = ((bk * (W * G) + rows) * NSPLIT + sp) * (HD + 2)
+        tl.store(ws_ptr + wb[:, None] + d[None, :], acc, mask=rmask[:, None])
+        tl.store(ws_ptr + wb + HD, m_i, mask=rmask)
+        tl.store(ws_ptr + wb + HD + 1, l_i, mask=rmask)
 
 
 @triton.jit
@@ -550,8 +550,9 @@ TRIG = int(os.environ.get("ENGINE_TRIG", "1"))
 
 
 class TritonOps:
-    def __init__(self, e):
+    def __init__(self, e, use_gemv=True):
         self.e = e
+        self.use_gemv = use_gemv
         assert e.hd & (e.hd - 1) == 0 and e.hd >= 2
         _probe_pdl()
         self.dummy_pos = torch.zeros(1, dtype=torch.long, device=e.dev)
@@ -580,13 +581,13 @@ class TritonOps:
         _silu_mul_kernel[(triton.cdiv(n, 1024),)](gu, out, n, inter, BLOCK=1024)
         return out
 
-    def qkv_post(self, qkv, l, kc, vc, B, S, pos):
+    def qkv_post(self, qkv, l, kc, vc, B, S, pos, last_query_only=False):
         e = self.e
         if pos is None:  # prefill: q token-major [B, S, nh, hd], returned as a [B, nh, S, hd] view
-            q = torch.empty((B, S, e.nh, e.hd), dtype=qkv.dtype, device=qkv.device)
+            q = torch.empty((B, 1 if last_query_only else S, e.nh, e.hd), dtype=qkv.dtype, device=qkv.device)
             _qkv_post_prefill_kernel[(B * S, e.nkv)](
                 qkv.contiguous(), l.qn, l.kn, e.cos, e.sin, q, kc, vc, S, kc.shape[2], e.eps,
-                NH=e.nh, NKV=e.nkv, HD=e.hd, num_warps=1,
+                NH=e.nh, NKV=e.nkv, HD=e.hd, LAST_QUERY_ONLY=last_query_only, num_warps=1,
             )
             return q.transpose(1, 2)
         q = torch.empty((B, e.nh, S, e.hd), dtype=qkv.dtype, device=qkv.device)
@@ -612,18 +613,16 @@ class TritonOps:
         while bk * nsplit < target and nsplit < 32:
             nsplit *= 2
         out = torch.empty((B * W, e.nh * e.hd), dtype=q.dtype, device=q.device)
-        final = nsplit == 1  # nothing to combine: the split kernel normalises and stores
-        ws = out if final else torch.empty(
-            (bk * W * G, nsplit, e.hd + 2), dtype=torch.float32, device=q.device
-        )
+        ws = (out if nsplit == 1 else
+              torch.empty((bk * W * G, nsplit, e.hd + 2), dtype=torch.float32, device=q.device))
         _launch(
             _attn_split_kernel, (bk, nsplit),
-            q, kc, vc, pos, ws, kc.shape[2], e.hd ** -0.5,
+            q, kc, vc, pos, ws, out, kc.shape[2], e.hd ** -0.5,
             NSPLIT=nsplit, G=G, W=W, GP=max(16, triton.next_power_of_2(W * G)), HD=e.hd,
             BLOCK_N=64, NKV=e.nkv, POS_STRIDE=1 if pos.numel() > 1 else 0,
-            num_warps=4, num_stages=ATTN_ST, PDL=PDL, TRIG=TRIG, FINAL=final,
+            num_warps=4, num_stages=ATTN_ST, PDL=PDL, TRIG=TRIG,
         )
-        if not final:
+        if nsplit > 1:
             _launch(
                 _attn_combine_kernel, (bk * W * G,),
                 ws, out, NSPLIT=nsplit, SP=nsplit, HD=e.hd, NKV=e.nkv, G=G, W=W, num_warps=1, PDL=PDL, TRIG=TRIG,
@@ -634,7 +633,8 @@ class TritonOps:
         M, K = x.shape
         N = w.shape[0]
         cfg = GEMM_CFG.get((N, K))
-        if cfg is None or M > 16 or not x.is_contiguous():
+        if (not self.use_gemv or cfg is None or M > 16 or not x.is_contiguous()
+                or not w.is_contiguous() or x.dtype != torch.bfloat16 or w.dtype != torch.bfloat16):
             return torch.nn.functional.linear(x, w)
         BN, BK, SK, ST, NW = cfg
         kps = triton.cdiv(triton.cdiv(K, SK), BK) * BK
@@ -661,7 +661,8 @@ class TritonOps:
         M, K = x.shape
         I = wgu.shape[0] // 2
         cfg = SILU_CFG.get((I, K))
-        if cfg is None or M > 16 or not x.is_contiguous():
+        if (not self.use_gemv or cfg is None or M > 16 or not x.is_contiguous()
+                or not wgu.is_contiguous() or x.dtype != torch.bfloat16 or wgu.dtype != torch.bfloat16):
             return self.silu_mul(self.linear(x, wgu))
         BN, BK, ST, NW = cfg
         even = EVEN_K and I % BN == 0 and K % BK == 0
@@ -678,7 +679,9 @@ class TritonOps:
         M, K = x.shape
         N = w.shape[0]
         cfg = GEMM_CFG.get((N, K))
-        if cfg is None or cfg[2] == 1 or M > 16 or not x.is_contiguous() or not h.is_contiguous():
+        if (not self.use_gemv or cfg is None or cfg[2] == 1 or M > 16
+                or not x.is_contiguous() or not w.is_contiguous() or not h.is_contiguous()
+                or x.dtype != torch.bfloat16 or w.dtype != torch.bfloat16 or h.dtype != torch.bfloat16):
             return self.add_rms(h, self.linear(x, w), lnw)
         BN, BK, SK, ST, NW = cfg
         kps = triton.cdiv(triton.cdiv(K, SK), BK) * BK

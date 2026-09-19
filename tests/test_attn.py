@@ -25,7 +25,8 @@ def ref(q, kc, vc, pos, W):
 
 worst = 0
 for B, W, cap, posl in [(1, 1, 640, [512]), (1, 7, 640, [512]), (1, 7, 640, [0]), (2, 7, 384, [200, 11]),
-                        (3, 5, 2304, [2048, 900, 5]), (4, 4, 640, [512, 512, 300, 0]), (16, 1, 640, [512] * 16)]:
+                        (3, 5, 2304, [2048, 900, 5]), (4, 4, 640, [512, 512, 300, 0]),
+                        (16, 1, 640, [512] * 16), (32, 1, 640, [512] * 32)]:
     kc = torch.randn(B, NKV, cap, HD, device=dev, dtype=torch.bfloat16)
     vc = torch.randn(B, NKV, cap, HD, device=dev, dtype=torch.bfloat16)
     q = torch.randn(B, NKV, W, G, HD, device=dev, dtype=torch.bfloat16)

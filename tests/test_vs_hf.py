@@ -41,4 +41,5 @@ with tempfile.TemporaryDirectory() as d:
     # ragged fallback
     r = list(eng.generate([[1, 2, 3], [4, 5, 6, 7]], 4))
     assert len(r) == 4 and all(len(x) == 2 for x in r)
+    assert list(eng.generate([[1, 2, 3]], 0)) == []
     print("all OK")

@@ -4,6 +4,7 @@ v2: fused Triton ops (fused.py) with load-time selftest + torch fallback.
 """
 import glob
 import json
+import math
 import os
 
 import torch
@@ -77,16 +78,20 @@ class _TorchOps:
             q.reshape(B, e.nkv, e.nh // e.nkv, e.hd), kc, vc, attn_mask=mask
         ).reshape(B, e.nh * e.hd)
 
-    def qkv_post(self, qkv, l, kc, vc, B, S, pos):
+    def qkv_post(self, qkv, l, kc, vc, B, S, pos, last_query_only=False):
         e = self.e
         nh, nkv, hd = e.nh, e.nkv, e.hd
         q, k, v = qkv.split([nh * hd, nkv * hd, nkv * hd], -1)
-        q = _rms(q.reshape(B, S, nh, hd), l.qn, e.eps).transpose(1, 2)
+        q = q.reshape(B, S, nh, hd)
+        if last_query_only:
+            q = q[:, -1:, :, :]
+        q = _rms(q, l.qn, e.eps).transpose(1, 2)
         k = _rms(k.reshape(B, S, nkv, hd), l.kn, e.eps).transpose(1, 2)
         v = v.reshape(B, S, nkv, hd).transpose(1, 2)
         if pos is None:
             cos, sin = e.cos[:S], e.sin[:S]
-            q, k = _rope(q, cos, sin), _rope(k, cos, sin)
+            qcos, qsin = (cos[-1:], sin[-1:]) if last_query_only else (cos, sin)
+            q, k = _rope(q, qcos, qsin), _rope(k, cos, sin)
             kc[:, :, :S] = k
             vc[:, :, :S] = v
         else:
@@ -220,8 +225,8 @@ class Engine:
             self.pool = torch.cuda.graph_pool_handle()
         self._build_rope(cap)
 
-    def _state(self, B, cap, graph=True, W=1):
-        key = (B, cap, W)
+    def _state(self, B, cap, graph=True, W=1, slot=None, decode_graph=True):
+        key = (B, cap, W, slot, decode_graph)
         st = self.states.get(key)
         if st is not None and (st.tried_graph or not graph):
             return st
@@ -252,7 +257,7 @@ class Engine:
             st.ev = torch.cuda.Event() if cu else None
         st.hcap = 0
         self.states[key] = st
-        if graph and self.dev.type == "cuda":
+        if graph and decode_graph and self.dev.type == "cuda":
             try:
                 self._capture(st)
             except Exception as e:  # fall back to eager decode
@@ -298,16 +303,19 @@ class Engine:
         last = self.L - 1
         for i, l in enumerate(self.layers):
             kc, vc = st.kc[i], st.vc[i]
-            q = ops.qkv_post(ops.linear(a, l.wqkv), l, kc, vc, B, S, pos)
+            q = ops.qkv_post(ops.linear(a, l.wqkv), l, kc, vc, B, S, pos,
+                             last_query_only=not decode and i == last)
             if decode:
                 o = ops.attn_decode(q, kc, vc, pos, S)
+            elif i == last:
+                o = F.scaled_dot_product_attention(
+                    q, kc[:, :, :S], vc[:, :, :S], enable_gqa=True
+                ).transpose(1, 2).reshape(B, nh * hd)
+                h = h[S - 1::S].contiguous()
             else:
                 o = F.scaled_dot_product_attention(
                     q, kc[:, :, :S], vc[:, :, :S], is_causal=True, enable_gqa=True
                 ).transpose(1, 2).reshape(T, nh * hd)
-                if i == last:  # only each sequence's last token feeds the head
-                    idx = torch.arange(1, B + 1, device=self.dev) * S - 1
-                    o, h = o[idx], h[idx]
             h, a = ops.linear_add_norm(o, l.wo, h, l.ln2)
             m = ops.gate_up_silu(a, l.wgu)
             h, a = ops.linear_add_norm(m, l.wd, h, self.layers[i + 1].ln1 if i < last else self.norm)
@@ -400,35 +408,46 @@ class Engine:
             return
         torch.manual_seed(0)
         B, S, n = 2, 96, 4
-        ids = torch.randint(100, 5000, (B, S), device=self.dev)
-        run = {}
-        for name, ops in (("torch", _TorchOps(self)), ("fused", None)):
+        high = min(5000, self.embed.shape[0])
+        ids = torch.randint(min(100, high - 1), high, (B, S), device=self.dev)
+
+        def run(ops, reference_tokens=None):
+            self.ops = ops
             try:
-                self.ops = ops or TritonOps(self)
                 st = self._state(B, 128, graph=False)
-                self._dbg, toks, steps = [], [], []
+                self._dbg, toks = [], []
                 st.pos.fill_(S)
                 self._prefill(ids, st)
                 for t in range(n):
                     toks.append(st.tok.clone())
                     if t < n - 1:
-                        if name == "fused":  # teacher-force the reference tokens
-                            st.tok.copy_(run["torch"][1][t])
+                        if reference_tokens is not None:
+                            st.tok.copy_(reference_tokens[t])
                         self._decode_body(st)
-                run[name] = (self._dbg, toks)
-            except Exception as e:
-                print(f"[engine] fused selftest error: {e!r}")
-                self.ops = _TorchOps(self)
-                self._dbg = None
-                self.states.clear()
-                return
+                return self._dbg, toks
             finally:
                 self._dbg = None
                 self.states.clear()
-        ref, got = run["torch"][0], run["fused"][0]
-        diff = max((r - g).abs().max().item() for r, g in zip(ref, got))
-        print(f"[engine] fused selftest max logit diff {diff:.4f}")
-        self.ops = TritonOps(self) if diff <= 0.5 else _TorchOps(self)
+        fallback = _TorchOps(self)
+        self.ops = fallback
+        selected = None
+        try:
+            ref, reference_tokens = run(fallback)
+            for label, use_gemv in (("full", True), ("without GEMV", False)):
+                try:
+                    candidate = TritonOps(self, use_gemv=use_gemv)
+                    got, _ = run(candidate, reference_tokens)
+                    diffs = [(r - g).abs().max().item() for r, g in zip(ref, got)]
+                    diff = max(diffs) if all(math.isfinite(d) for d in diffs) else float("inf")
+                    print(f"[engine] fused {label} selftest max logit diff {diff:.4f}")
+                    if diff <= 0.5:
+                        selected = candidate
+                        break
+                except Exception as e:
+                    print(f"[engine] fused {label} selftest error: {e!r}")
+        except Exception as e:
+            print(f"[engine] fused selftest error: {e!r}")
+        self.ops = selected if selected is not None else fallback
         off = [x for x in os.environ.get("ENGINE_OFF", "").split(",") if x]
         if off and isinstance(self.ops, TritonOps):
             self.ops = _Mixed(self.ops, _TorchOps(self), off)
@@ -436,6 +455,8 @@ class Engine:
     # --------------------------------------------------------------- generate
     @torch.inference_mode()
     def generate(self, input_ids, max_new_tokens):
+        if max_new_tokens <= 0:
+            return
         B = len(input_ids)
         S = len(input_ids[0])
         if any(len(x) != S for x in input_ids):
@@ -448,7 +469,7 @@ class Engine:
         cap = -(-(S + n) // CAP_GRAN) * CAP_GRAN
         if cap > self.cos.shape[0]:
             self._grow_rope(cap)
-        st = self._state(B, cap)
+        st = self._state(B, cap, slot=S, decode_graph=n > 1)
         self._host_bufs(st, n)
         ids = torch.tensor(input_ids, dtype=torch.long, device=self.dev)
         self._prefill(ids, st)
@@ -531,6 +552,15 @@ class Engine:
                 yielded += 1
 
     def _generate_ragged(self, input_ids, n):
-        outs = [[t[0] for t in self.generate([seq], n)] for seq in input_ids]
-        for t in range(n):
-            yield [o[t] for o in outs]
+        groups = {}
+        for i, seq in enumerate(input_ids):
+            groups.setdefault(len(seq), []).append(i)
+        streams = [(indices, self.generate([input_ids[i] for i in indices], n))
+                   for indices in groups.values()]
+        for _ in range(n):
+            step = [0] * len(input_ids)
+            for indices, stream in streams:
+                tokens = next(stream)
+                for i, token in zip(indices, tokens):
+                    step[i] = token
+            yield step

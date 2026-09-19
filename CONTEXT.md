@@ -18,9 +18,15 @@ Make Qwen3-4B decode faster on 1x H100, **output unchanged**. Score = geomean to
 engine/engine.py   Engine: weight load, static KV, CUDA-graph decode, pipelined host sync, load-time selftest
 engine/fused.py    Triton kernels + TritonOps (add+rmsnorm, qk-norm+rope+cache write, silu*up, split-KV attn, skinny split-K GEMM)
 tests/bench.py     GPU bench + correctness vs HF baseline (mimics platform)
-tests/prof.py      torch.profiler kernel table for one generate()
+tests/prof.py      torch.profiler kernel table for full generation, prefill, or decode
 tests/test_attn.py GPU: Triton attn vs SDPA
-tests/test_fused.py fused ops vs torch ops (CPU via TRITON_INTERPRET=1, or GPU)
+tests/test_prefill_last_query.py GPU: last-query prefill vs full causal attention
+tests/test_fused.py fused ops vs torch ops on CUDA GPU
+tests/test_selftest_fallback.py GPU: force bad GEMV and verify selective fallback
+tests/test_linear_precision.py GPU: GEMV dtype/layout fallback
+tests/test_ragged_gpu.py GPU: interleaved ragged groups vs separate groups
+tests/compile_triton_offline.py Linux: compile all fused kernel families for SM90 without GPU execution
+tests/probe_gpu_no_torch.py Linux: run fused SiLU, add+RMSNorm, last-query QKV prefill, and single-split attention on a CUDA GPU through the driver, without PyTorch
 tests/test_vs_hf.py CPU: engine vs HF greedy on tiny random Qwen3 (fp32)
 tests/gemv_bench.py skinny-GEMM microbench, cuBLAS vs Triton
 ```
@@ -28,11 +34,12 @@ Only `engine/` is submitted. Keep notes/tools/tokens outside it.
 
 ## Engine design (what's in there)
 - **v1**: torch ops, static KV cache (`B x nkv x cap x hd`, cap rounded to 128), decode captured in a CUDA graph per `(B, cap)` (max 6 cached states), D2H copy + event per step so `yield` of step t-1 overlaps GPU step t. Prefill uses SDPA causal; only last token per seq goes to lm_head. Fused wqkv and gate|up weights.
+- **Current prefill**: the final layer normalizes/rotates/stores each sequence's last query only, while caching every key and value; that query attends to all prompt keys.
 - **v2** (`fused.py`): Triton fused add+rmsnorm, qk-norm+rope+KV write, silu*up. Mirrors ref bf16 rounding points.
 - **v3**: split-KV Triton decode attention (+combine kernel), reads `pos` from a device tensor (graph-safe).
 - **v4**: Triton split-K skinny GEMM for decode linears when M<=16; falls to `F.linear` for unlisted shapes / M>16 (`GEMM_CFG` in fused.py).
-- **Safety net**: `Engine._selftest()` runs torch ops vs fused ops on real weights at load (teacher-forced); uses fused only if max logit diff <= 0.5, else falls back to `_TorchOps`. Graph capture failure falls back to eager.
-- Ragged prompt lengths -> per-sequence fallback (slow; hidden workloads are presumably equal length).
+- **Safety net**: `Engine._selftest()` runs torch ops vs fused ops on real weights at load (teacher-forced). If the full fused path exceeds 0.5 max logit diff, it retries fused ops with Torch GEMM before falling back to `_TorchOps`. Graph capture failure falls back to eager.
+- Ragged prompt lengths -> group equal lengths and interleave decode steps; each group keeps its own KV state.
 
 ## Results
 | ver | official tok/s | notes |
@@ -43,6 +50,7 @@ Only `engine/` is submitted. Keep notes/tools/tokens outside it.
 | v4 | 949.0 | Triton split-K skinny GEMM for decode linears (M<=16) |
 | v5 | 968.9 (#7) | fused split-K reduce+residual+rmsnorm; silu epilogue in gate/up GEMV |
 | v7 | pending | token-major prefill qkv kernel (no flash-output copy) |
+| merged local work | unmeasured | last-query final prefill, single-split direct attention, precision guards, ragged groups, selective fused fallback; run full-model correctness and H100 timing |
 
 | v13 | 1035.2 | CUDA-graphed small prefills (flat on public shapes, helps short prompts) |
 | v14 | 1042.4 | mask-free GEMV (EVENK) + alignment hints |
@@ -81,15 +89,18 @@ python tests/bench.py --model /workspace/model
 python tests/bench.py --shapes 1,512,32 --no-check       # quick perf only
 # other shapes: "B,S,n" e.g. 8,1024,64
 
-python tests/prof.py 16 512 128                           # kernel profile (MODEL env = model path)
+python tests/prof.py 16 512 128 --phase decode            # decode profile (MODEL env = model path)
+python tests/prof.py 4 2048 32 --phase prefill            # prefill profile
 python tests/test_attn.py                                 # GPU attn vs SDPA
-python tests/test_fused.py                                # GPU, or CPU w/ TRITON_INTERPRET=1 (default)
+python tests/test_fused.py                                # compiled CUDA kernels only
+python tests/compile_triton_offline.py                    # Linux + Triton 3.1, offline SM90 compile
+python tests/probe_gpu_no_torch.py                        # Linux + Triton 3.1 + NVIDIA GPU, torch-free fused precision probe
 python tests/test_vs_hf.py                                # CPU, no model needed
 python tests/gemv_bench.py                                # GEMM microbench
 ```
 Bench correctness line: `worst gap` must stay <= 2.0 and `positions > 2.0: 0`. Watch `spread` <= 25%, and TPOT/TTFT vs baseline.
 
-No GPU? Logic-check Triton on CPU: `triton-windows`/triton + `TRITON_INTERPRET=1` (fp32, slow) via `tests/test_fused.py` and `tests/test_vs_hf.py`. Kernel perf and bf16 rounding still need the H100.
+No H100? Run the fused-op and attention correctness tests on another CUDA GPU; performance still needs the H100. The tiny HF comparison in `tests/test_vs_hf.py` can run on CPU.
 
 ## Submitting
 1. GitHub App connected to this repo (Repositories page, engine folder = `engine`, auto-run on).
