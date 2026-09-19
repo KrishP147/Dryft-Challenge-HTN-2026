@@ -174,8 +174,14 @@ host_qkv = (c.c_uint16 * (B * S * TOTAL))(
     *(bf16(((i % 31) - 15) / 16) for i in range(B * S * TOTAL)))
 host_qn = (c.c_uint16 * HD)(*(bf16(1.0) for _ in range(HD)))
 host_kn = (c.c_uint16 * HD)(*(bf16(1.0) for _ in range(HD)))
-host_cos = (c.c_uint16 * (S * HD))(*(bf16(1.0) for _ in range(S * HD)))
-host_sin = (c.c_uint16 * (S * HD))()
+# Identity, quarter turn, and a mixed rotation check position indexing,
+# rotate-half signs, and the separate BF16 multiply/add rounding points.
+rot_cos = [1.0, 0.0, 0.75]
+rot_sin = [0.0, 1.0, 0.25]
+host_cos = (c.c_uint16 * (S * HD))(
+    *(bf16(rot_cos[s]) for s in range(S) for _ in range(HD)))
+host_sin = (c.c_uint16 * (S * HD))(
+    *(bf16(rot_sin[s]) for s in range(S) for _ in range(HD)))
 host_q = (c.c_uint16 * (B * NH * HD))()
 host_k = (c.c_uint16 * (B * NKV * CAP * HD))()
 host_v = (c.c_uint16 * (B * NKV * CAP * HD))()
@@ -199,7 +205,20 @@ def expected_head(t, h):
     off = t * TOTAL + h * HD
     values = [from_bf16(host_qkv[off + d]) for d in range(HD)]
     var = sum(v * v for v in values) / HD
-    return [from_bf16(bf16(v / math.sqrt(var + EPS))) for v in values]
+    normed = [from_bf16(bf16(v / math.sqrt(var + EPS))) for v in values]
+    position = t % S
+    if position == 1:
+        return [-v for v in normed[HD // 2:]] + normed[:HD // 2]
+    if position == 2:
+        rotated = []
+        for d in range(HD):
+            partner = normed[d + HD // 2] if d < HD // 2 else normed[d - HD // 2]
+            signed = -partner if d < HD // 2 else partner
+            a = from_bf16(bf16(normed[d] * rot_cos[position]))
+            b = from_bf16(bf16(signed * rot_sin[position]))
+            rotated.append(from_bf16(bf16(a + b)))
+        return rotated
+    return normed
 
 
 for b in range(B):
