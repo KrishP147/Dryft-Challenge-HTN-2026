@@ -16,7 +16,7 @@ except Exception as _e:  # no triton / import failure: torch ops only
     _FUSED_ERR = repr(_e)
 
 CAP_GRAN = 128
-SPEC = os.environ.get("ENGINE_SPEC", "1") != "0"  # exact n-gram speculation, B=1 only (timing is content-dependent)
+SPEC = os.environ.get("ENGINE_SPEC", "0") == "1"  # exact n-gram speculation, B=1 only; off by default (timing is content-dependent)
 SPEC_W_MAX = 7  # verify width: 1 known token + up to 6 n-gram drafts
 SPEC_ROWS = 16  # max B*W rows through the skinny GEMVs
 MAX_STATES = 6
