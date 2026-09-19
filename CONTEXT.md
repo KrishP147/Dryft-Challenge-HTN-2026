@@ -25,7 +25,7 @@ tests/test_fused.py fused ops vs torch ops on CUDA GPU
 tests/test_selftest_fallback.py GPU: force bad GEMV and verify selective fallback
 tests/test_linear_precision.py GPU: GEMV dtype/layout fallback
 tests/test_ragged_gpu.py GPU: interleaved ragged groups vs separate groups
-tests/compile_triton_offline.py Linux: compile QKV and attention kernels for SM90 without GPU execution
+tests/compile_triton_offline.py Linux: compile all fused kernel families for SM90 without GPU execution
 tests/test_vs_hf.py CPU: engine vs HF greedy on tiny random Qwen3 (fp32)
 tests/gemv_bench.py skinny-GEMM microbench, cuBLAS vs Triton
 ```
