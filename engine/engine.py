@@ -44,6 +44,9 @@ class _TorchOps:
     def __init__(self, e):
         self.e = e
 
+    def linear(self, x, w):
+        return F.linear(x, w)
+
     def rms(self, h, w):
         return _rms(h, w, self.e.eps)
 
@@ -215,7 +218,7 @@ class Engine:
         last = self.L - 1
         for i, l in enumerate(self.layers):
             kc, vc = st.kc[i], st.vc[i]
-            q = ops.qkv_post(F.linear(a, l.wqkv), l, kc, vc, B, S, pos)
+            q = ops.qkv_post(ops.linear(a, l.wqkv), l, kc, vc, B, S, pos)
             if decode:
                 o = ops.attn_decode(q, kc, vc, pos)
             else:
@@ -225,11 +228,11 @@ class Engine:
                 if i == last:  # only each sequence's last token feeds the head
                     idx = torch.arange(1, B + 1, device=self.dev) * S - 1
                     o, h = o[idx], h[idx]
-            h, a = ops.add_rms(h, F.linear(o, l.wo), l.ln2)
-            m = ops.silu_mul(F.linear(a, l.wgu))
+            h, a = ops.add_rms(h, ops.linear(o, l.wo), l.ln2)
+            m = ops.silu_mul(ops.linear(a, l.wgu))
             nxt = self.layers[i + 1].ln1 if i < last else self.norm
-            h, a = ops.add_rms(h, F.linear(m, l.wd), nxt)
-        logits = F.linear(a, self.lm_head)
+            h, a = ops.add_rms(h, ops.linear(m, l.wd), nxt)
+        logits = ops.linear(a, self.lm_head)
         if self._dbg is not None:
             self._dbg.append(logits.float().cpu())
         return logits.argmax(-1)

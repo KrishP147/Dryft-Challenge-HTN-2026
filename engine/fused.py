@@ -172,6 +172,56 @@ def _attn_combine_kernel(
     tl.store(out_ptr + r * HD + d, o.to(out_ptr.dtype.element_ty))
 
 
+@triton.jit
+def _gemv_kernel(
+    x_ptr, w_ptr, out_ptr, M, N, K, kps, stride_om,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, FINAL: tl.constexpr,
+):
+    # skinny GEMM: out[M, N] = x[M, K] @ w[N, K]^T, M <= BM (16). Each program owns
+    # BN rows of w and one K-slice (split-K). Bandwidth-bound: w is read once.
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    rn = pid_n * BN + tl.arange(0, BN)
+    rm = tl.arange(0, BM)
+    mm = rm < M
+    nm = rn < N
+    k_lo = pid_k * kps
+    k_hi = tl.minimum(k_lo + kps, K)
+    acc = tl.zeros([BM, BN], tl.float32)
+    for k in range(k_lo, k_hi, BK):
+        rk = k + tl.arange(0, BK)
+        km = rk < k_hi
+        x = tl.load(x_ptr + rm[:, None] * K + rk[None, :], mask=mm[:, None] & km[None, :], other=0.0)
+        w = tl.load(w_ptr + rn[None, :] * K + rk[:, None], mask=nm[None, :] & km[:, None], other=0.0)
+        acc = tl.dot(x, w, acc)
+    if FINAL:
+        tl.store(out_ptr + rm[:, None] * stride_om + rn[None, :], acc.to(out_ptr.dtype.element_ty),
+                 mask=mm[:, None] & nm[None, :])
+    else:
+        tl.store(out_ptr + pid_k * M * stride_om + rm[:, None] * stride_om + rn[None, :], acc,
+                 mask=mm[:, None] & nm[None, :])
+
+
+@triton.jit
+def _splitk_reduce_kernel(ws_ptr, out_ptr, n, SK: tl.constexpr, BLOCK: tl.constexpr):
+    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = idx < n
+    acc = tl.zeros([BLOCK], tl.float32)
+    for i in range(SK):
+        acc += tl.load(ws_ptr + i * n + idx, mask=m, other=0.0)
+    tl.store(out_ptr + idx, acc.to(out_ptr.dtype.element_ty), mask=m)
+
+
+# (N, K) -> (BN, BK, SPLIT_K, stages, warps), swept on H100 (tests/gemv_bench.py)
+GEMM_CFG = {
+    (6144, 2560): (64, 128, 1, 5, 4),
+    (2560, 4096): (64, 256, 2, 4, 4),
+    (19456, 2560): (64, 64, 1, 4, 4),
+    (2560, 9728): (32, 128, 4, 4, 4),
+    (151936, 2560): (64, 256, 1, 3, 4),
+}
+
+
 class TritonOps:
     def __init__(self, e):
         self.e = e
@@ -231,4 +281,27 @@ class TritonOps:
         _attn_combine_kernel[(bk * G,)](
             ws, out, NSPLIT=nsplit, SP=nsplit, HD=e.hd, num_warps=1
         )
+        return out
+
+    def linear(self, x, w):
+        M, K = x.shape
+        N = w.shape[0]
+        cfg = GEMM_CFG.get((N, K))
+        if cfg is None or M > 16 or not x.is_contiguous():
+            return torch.nn.functional.linear(x, w)
+        BN, BK, SK, ST, NW = cfg
+        kps = triton.cdiv(triton.cdiv(K, SK), BK) * BK
+        out = torch.empty((M, N), dtype=x.dtype, device=x.device)
+        if SK == 1:
+            _gemv_kernel[(triton.cdiv(N, BN), 1)](
+                x, w, out, M, N, K, kps, N,
+                BM=16, BN=BN, BK=BK, FINAL=True, num_warps=NW, num_stages=ST,
+            )
+            return out
+        ws = torch.empty((SK, M, N), dtype=torch.float32, device=x.device)
+        _gemv_kernel[(triton.cdiv(N, BN), SK)](
+            x, w, ws, M, N, K, kps, N,
+            BM=16, BN=BN, BK=BK, FINAL=False, num_warps=NW, num_stages=ST,
+        )
+        _splitk_reduce_kernel[(triton.cdiv(M * N, 1024),)](ws, out, M * N, SK=SK, BLOCK=1024)
         return out
