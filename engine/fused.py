@@ -16,7 +16,7 @@ import triton.language as tl
 # Enabled by patching Triton's generated C launcher: kernels whose packed metadata
 # has cluster_dim_x == _PDL_MAGIC launch via cuLaunchKernelEx + the PDL attribute.
 _PDL_MAGIC = 7
-PDL = os.environ.get("ENGINE_PDL", "1") != "0"
+PDL = os.environ.get("ENGINE_PDL", "1") != "0" and os.environ.get("TRITON_INTERPRET") != "1"
 
 
 def _install_pdl():
@@ -63,7 +63,7 @@ if PDL:
 def _launch(fn, grid, *args, **kw):
     """fn[grid](*args, **kw), then mark the compiled kernel for PDL launches."""
     k = fn[grid](*args, **kw)
-    if PDL and k.packed_metadata[3] != _PDL_MAGIC:
+    if PDL and k is not None and k.packed_metadata[3] != _PDL_MAGIC:
         k.packed_metadata = (*k.packed_metadata[:3], _PDL_MAGIC, 1, 1)
     return k
 
@@ -76,6 +76,50 @@ def _gdc_wait():
 @triton.jit
 def _gdc_launch():
     tl.inline_asm_elementwise("griddepcontrol.launch_dependents;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+
+
+@triton.jit
+def _pdl_probe_kernel(x_ptr, PDL: tl.constexpr):
+    if PDL:
+        _gdc_launch()
+        _gdc_wait()
+    i = tl.arange(0, 1024)
+    tl.store(x_ptr + i, tl.load(x_ptr + i) + 1.0)
+
+
+def _probe_pdl():
+    """Chain of dependent PDL launches inside a CUDA graph must still count exactly;
+    on any error or wrong result PDL is switched off (plain launches)."""
+    global PDL
+    if not PDL:
+        return
+    try:
+        x = torch.zeros(1024, device="cuda")
+        n = 64
+        for _ in range(3):  # compile + mark
+            _launch(_pdl_probe_kernel, (1,), x, PDL=True)
+        torch.cuda.synchronize()
+        x.zero_()
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(n):
+                _launch(_pdl_probe_kernel, (1,), x, PDL=True)
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        assert bool((x == n).all()), "eager PDL chain miscounted"
+        x.zero_()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for _ in range(n):
+                _launch(_pdl_probe_kernel, (1,), x, PDL=True)
+        for r in range(3):
+            g.replay()
+        torch.cuda.synchronize()
+        assert bool((x == 3 * n).all()), "graph PDL chain miscounted"
+    except Exception as e:
+        print(f"[fused] PDL probe failed, disabling: {e!r}")
+        PDL = False
 
 
 @triton.jit
@@ -476,6 +520,7 @@ class TritonOps:
     def __init__(self, e):
         self.e = e
         assert e.hd & (e.hd - 1) == 0 and e.hd >= 2
+        _probe_pdl()
         self.dummy_pos = torch.zeros(1, dtype=torch.long, device=e.dev)
 
     def _rms_launch(self, h, d, w, has_add):
