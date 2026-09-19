@@ -20,6 +20,7 @@ ap.add_argument("--model", default="/workspace/model")
 ap.add_argument("--shapes", nargs="*", default=["1,512,32", "4,2048,32", "16,512,128"])
 ap.add_argument("--samples", type=int, default=5)
 ap.add_argument("--no-check", action="store_true")
+ap.add_argument("--random", action="store_true", help="random-token prompts instead of natural text")
 args = ap.parse_args()
 
 from engine import Engine  # noqa: E402
@@ -30,9 +31,23 @@ torch.cuda.synchronize()
 print(f"load+init {time.time() - t0:.1f}s", flush=True)
 
 
+_CORPUS = None
+
+
 def prompts(B, S, seed):
-    g = torch.Generator().manual_seed(seed)
-    return torch.randint(1000, 100000, (B, S), generator=g).tolist()
+    global _CORPUS
+    if args.random:
+        g = torch.Generator().manual_seed(seed)
+        return torch.randint(1000, 100000, (B, S), generator=g).tolist()
+    if _CORPUS is None:
+        import pydoc_data.topics as t
+        from transformers import AutoTokenizer
+
+        _CORPUS = AutoTokenizer.from_pretrained(args.model)(" ".join(t.topics.values()), add_special_tokens=False)["input_ids"]
+    import random
+
+    r = random.Random(seed * 7919 + B * 31 + S)
+    return [_CORPUS[o : o + S] for o in (r.randrange(0, len(_CORPUS) - S) for _ in range(B))]
 
 
 def run(ids, n):
@@ -60,6 +75,7 @@ for spec in args.shapes:
         ts.append(total)
         tf.append(first)
         outs.append((ids, out))
+    print("   samples ms:", [round(x * 1e3, 1) for x in ts])
     med = statistics.median(ts)
     spread = (max(ts) - min(ts)) / med
     tpot = (med - statistics.median(tf)) / max(n - 1, 1)

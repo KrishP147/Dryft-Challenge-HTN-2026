@@ -24,7 +24,7 @@ def corpora():
     out["code"] = "\n".join(open(f, errors="ignore").read() for f in sorted(glob.glob("/usr/lib/python3*/json/*.py") + glob.glob("/usr/lib/python3*/argparse.py"))[:6]) or open(__import__("json").__file__).read()
     return out
 
-def draft(hist, K=4, ngrams=(3, 2)):
+def draft(hist, K, ngrams):
     for n in ngrams:
         if len(hist) < n + 1: continue
         key = hist[-n:]
@@ -33,21 +33,24 @@ def draft(hist, K=4, ngrams=(3, 2)):
                 return hist[i + n:i + n + K]
     return []
 
+VARIANTS = [(K, ng) for K in (3, 4, 6, 8) for ng in ((3, 2), (4, 3, 2), (2,), (3, 2, 1), (5, 3, 2, 1))]
 for name, text in corpora().items():
     ids = tok(text, add_special_tokens=False)["input_ids"]
-    rng = random.Random(0)
-    tot_steps = tot_tokens = 0
-    for trial in range(6):
-        s = rng.randrange(0, max(1, len(ids) - 700))
-        prompt = ids[s:s + 512]
-        out = [x[0] for x in eng.generate([prompt], 96)]
-        hist = list(prompt)
-        i = 0
-        while i < len(out):
-            d = draft(hist)
-            a = 0
-            while a < len(d) and i + a < len(out) and d[a] == out[i + a]: a += 1
-            adv = min(a + 1, len(out) - i)   # accepted drafts + 1 bonus token
-            hist += out[i:i + adv]; i += adv
-            tot_steps += 1; tot_tokens += adv
-    print(f"{name:6s}: {tot_tokens/tot_steps:.2f} tokens/step  ({tot_tokens} tokens, {tot_steps} verify steps)", flush=True)
+    rng = random.Random(1)
+    runs = []
+    for trial in range(10):
+        s0 = rng.randrange(0, max(1, len(ids) - 700))
+        prompt = ids[s0:s0 + 512]
+        runs.append((prompt, [x[0] for x in eng.generate([prompt], 128)]))
+    res = []
+    for K, ng in VARIANTS:
+        st_ = tk = 0
+        for prompt, out in runs:
+            hist = list(prompt); i = 0
+            while i < len(out):
+                d = draft(hist, K, ng); a = 0
+                while a < len(d) and i + a < len(out) and d[a] == out[i + a]: a += 1
+                adv = min(a + 1, len(out) - i); hist += out[i:i + adv]; i += adv; st_ += 1; tk += adv
+        res.append((tk / st_, K, ng))
+    res.sort(reverse=True)
+    print(name, [f"{r:.2f} K={k} n={g}" for r, k, g in res[:5]], "| worst", f"{res[-1][0]:.2f}", flush=True)

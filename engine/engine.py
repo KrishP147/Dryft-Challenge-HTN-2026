@@ -16,6 +16,9 @@ except Exception as _e:  # no triton / import failure: torch ops only
     _FUSED_ERR = repr(_e)
 
 CAP_GRAN = 128
+SPEC = os.environ.get("ENGINE_SPEC", "0") == "1"  # off: content-dependent timing breaks the 25% spread gate
+SPEC_W_MAX = 7  # verify width: 1 known token + up to 6 n-gram drafts
+SPEC_ROWS = 16  # max B*W rows through the skinny GEMVs
 MAX_STATES = 6
 ROPE_LEN = 8192
 
@@ -61,7 +64,7 @@ class _TorchOps:
         g, u = gu.chunk(2, -1)
         return F.silu(g) * u
 
-    def attn_decode(self, q, kc, vc, pos):
+    def attn_decode(self, q, kc, vc, pos, W=1):
         e = self.e
         B, cap = q.shape[0], kc.shape[2]
         mask = (
@@ -93,6 +96,35 @@ class _TorchOps:
         return q
 
 
+class _NG:
+    """Prompt-lookup drafter: most recent earlier occurrence of the last 3/2/1 tokens."""
+
+    def __init__(self, prompt):
+        self.h = list(prompt)
+        self.d = ({}, {}, {})
+        for i in range(1, len(self.h)):
+            self._reg(i)
+
+    def _reg(self, i):  # token i just appended: n-grams ending at i-1 continue at i
+        h, d = self.h, self.d
+        for n in (1, 2, 3):
+            if i >= n:
+                d[n - 1][tuple(h[i - n : i])] = i
+
+    def push(self, tok):
+        self.h.append(tok)
+        self._reg(len(self.h) - 1)
+
+    def draft(self, k):
+        h = self.h
+        L = len(h)
+        for n in (3, 2, 1):
+            j = self.d[n - 1].get(tuple(h[L - n :])) if L >= n else None
+            if j is not None and j < L:
+                return h[j : j + k]
+        return []
+
+
 class _Layer:
     pass
 
@@ -119,8 +151,10 @@ class Engine:
         self._dbg = None
         self.ops = _TorchOps(self)
         self.pool = torch.cuda.graph_pool_handle() if self.dev.type == "cuda" else None
+        self.spec_ok = False
         if self.dev.type == "cuda":
             self._selftest()
+            self._selftest_spec()
 
     # ---------------------------------------------------------------- weights
     def _load(self, model_path):
@@ -156,8 +190,8 @@ class Engine:
         self.cos, self.sin = _build_rope_tables(self.theta, self.hd, n, self.dev, self.dtype)
 
     # ------------------------------------------------------------------ state
-    def _state(self, B, cap, graph=True):
-        key = (B, cap)
+    def _state(self, B, cap, graph=True, W=1):
+        key = (B, cap, W)
         st = self.states.get(key)
         if st is not None and (st.tried_graph or not graph):
             return st
@@ -166,7 +200,7 @@ class Engine:
             if self.dev.type == "cuda":
                 torch.cuda.empty_cache()
         st = _State()
-        st.B, st.cap = B, cap
+        st.B, st.cap, st.W = B, cap, W
         shape = (B, self.nkv, cap, self.hd)
         # zeros, not empty: masked slots must be finite (0 * NaN = NaN)
         st.kc = [torch.zeros(shape, dtype=self.dtype, device=self.dev) for _ in range(self.L)]
@@ -176,6 +210,15 @@ class Engine:
         st.ar = torch.arange(cap, device=self.dev)
         st.graph = None
         st.tried_graph = graph
+        if W > 1:  # speculative verify buffers: one flat H2D copy in, one D2H out
+            cu = self.dev.type == "cuda"
+            st.in_dev = torch.zeros(B * W + B, dtype=torch.long, device=self.dev)
+            st.in_host = torch.zeros(B * W + B, dtype=torch.long, pin_memory=cu)
+            st.sin = st.in_dev[: B * W].view(B, W)
+            st.spos = st.in_dev[B * W :]
+            st.sout = torch.zeros((B, W), dtype=torch.long, device=self.dev)
+            st.sout_host = torch.zeros((B, W), dtype=torch.long, pin_memory=cu)
+            st.ev = torch.cuda.Event() if cu else None
         st.hcap = 0
         self.states[key] = st
         if graph and self.dev.type == "cuda":
@@ -194,17 +237,20 @@ class Engine:
             st.events = [torch.cuda.Event() for _ in range(st.hcap)] if pin else None
 
     def _capture(self, st):
+        body = self._spec_body if st.W > 1 else self._decode_body
         st.pos.zero_()
+        if st.W > 1:
+            st.in_dev.zero_()
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(3):
-                self._decode_body(st)
+                body(st)
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g, pool=self.pool):
-            self._decode_body(st)
+            body(st)
         st.graph = g
         torch.cuda.synchronize()
 
@@ -223,7 +269,7 @@ class Engine:
             kc, vc = st.kc[i], st.vc[i]
             q = ops.qkv_post(ops.linear(a, l.wqkv), l, kc, vc, B, S, pos)
             if decode:
-                o = ops.attn_decode(q, kc, vc, pos)
+                o = ops.attn_decode(q, kc, vc, pos, S)
             else:
                 o = F.scaled_dot_product_attention(
                     q, kc[:, :, :S], vc[:, :, :S], is_causal=True, enable_gqa=True
@@ -245,6 +291,42 @@ class Engine:
     def _decode_body(self, st):
         st.tok.copy_(self._forward(st, st.tok, 1, st.pos))
         st.pos.add_(1)
+
+    def _spec_body(self, st):
+        st.sout.copy_(self._forward(st, st.sin.reshape(-1), st.W, st.spos).view(st.B, st.W))
+
+    def _selftest_spec(self):
+        """Verify-width forward vs step-by-step decode on the real weights."""
+        if not SPEC or TritonOps is None or not isinstance(self.ops, TritonOps):
+            return
+        try:
+            torch.manual_seed(1)
+            B, S, W = 1, 96, 5
+            ids = torch.randint(100, 5000, (B, S), device=self.dev)
+            st = self._state(B, 128, graph=False)
+            self._dbg = []
+            st.pos.fill_(S)
+            self._prefill(ids, st)
+            toks = [st.tok.clone()]
+            for _ in range(W):
+                self._decode_body(st)
+                toks.append(st.tok.clone())
+            plain, self._dbg = self._dbg, []
+            sp = self._state(B, 128, graph=False, W=W)
+            self._prefill(ids, sp)
+            sp.sin.copy_(torch.stack(toks[:W], 1))
+            sp.spos.fill_(S)
+            self._spec_body(sp)
+            got = self._dbg[-1]
+            diff = max((got[j] - plain[j + 1][0]).abs().max().item() for j in range(W))
+            print(f"[engine] spec selftest max logit diff {diff:.4f}")
+            self.spec_ok = diff <= 0.5
+        except Exception as e:
+            print(f"[engine] spec selftest error: {e!r}")
+            self.spec_ok = False
+        finally:
+            self._dbg = None
+            self.states.clear()
 
     def _selftest(self):
         """Fused ops vs torch ops on the real weights; keep fused only if close."""
@@ -292,6 +374,9 @@ class Engine:
             yield from self._generate_ragged(input_ids, max_new_tokens)
             return
         n = max_new_tokens
+        if self.spec_ok and SPEC and B <= 4 and n >= 3:
+            yield from self._generate_spec(input_ids, n)
+            return
         cap = -(-(S + n) // CAP_GRAN) * CAP_GRAN
         if cap > self.cos.shape[0]:
             self.states.clear()
@@ -319,6 +404,65 @@ class Engine:
         if cuda:
             ev[n - 1].synchronize()
         yield host[n - 1].tolist()
+
+    def _generate_spec(self, input_ids, n):
+        """Exact n-gram speculative decoding for tiny batches: each step verifies
+        W tokens per sequence (last accepted + drafts) in one graph replay, keeps
+        the longest prefix whose drafts equal the model's own greedy outputs, plus
+        one bonus token. KV entries of rejected drafts are overwritten later."""
+        B, S = len(input_ids), len(input_ids[0])
+        W = min(SPEC_W_MAX, SPEC_ROWS // B)
+        K = W - 1
+        cap = -(-(S + n + W) // CAP_GRAN) * CAP_GRAN
+        if cap > self.cos.shape[0]:
+            self.states.clear()
+            self._build_rope(cap)
+        st = self._state(B, cap, W=W)
+        ids = torch.tensor(input_ids, dtype=torch.long, device=self.dev)
+        self._prefill(ids, st)  # async
+        ng = [_NG(p) for p in input_ids]  # CPU work overlaps the GPU prefill
+        first = st.tok.tolist()
+        out = [[t] for t in first]
+        for b in range(B):
+            ng[b].push(first[b])
+        last, pos = list(first), [S] * B
+        yielded = 1
+        yield list(first)
+        cuda = st.ev is not None
+        while yielded < n:
+            rows = []
+            for b in range(B):
+                d = ng[b].draft(K) if len(out[b]) < n else []
+                rows.append([last[b]] + d + [last[b]] * (K - len(d)))
+            flat = [t for r in rows for t in r] + pos
+            st.in_host.copy_(torch.tensor(flat, dtype=torch.long))
+            st.in_dev.copy_(st.in_host, non_blocking=cuda)
+            if st.graph is not None:
+                st.graph.replay()
+            else:
+                self._spec_body(st)
+            st.sout_host.copy_(st.sout, non_blocking=cuda)
+            if cuda:
+                st.ev.record()
+                st.ev.synchronize()
+            res = st.sout_host.tolist()
+            for b in range(B):
+                if len(out[b]) >= n:
+                    continue
+                o, r = res[b], rows[b]
+                a = 0
+                while a < K and r[a + 1] == o[a]:
+                    a += 1
+                new = o[: min(a + 1, n - len(out[b]))]
+                out[b] += new
+                for t in new:
+                    ng[b].push(t)
+                last[b] = new[-1]
+                pos[b] += len(new)
+            m = min(len(x) for x in out)
+            while yielded < m:
+                yield [out[b][yielded] for b in range(B)]
+                yielded += 1
 
     def _generate_ragged(self, input_ids, n):
         outs = [[t[0] for t in self.generate([seq], n)] for seq in input_ids]
