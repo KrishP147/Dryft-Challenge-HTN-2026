@@ -22,6 +22,7 @@ ap.add_argument("--samples", type=int, default=5)
 ap.add_argument("--no-check", action="store_true")
 ap.add_argument("--check-all", action="store_true", help="teacher-forced check on every sample")
 ap.add_argument("--random", action="store_true", help="random-token prompts instead of natural text")
+ap.add_argument("--corpus", default="pydoc", choices=["pydoc", "code", "repeat"], help="prompt source when not --random")
 args = ap.parse_args()
 
 from engine import Engine  # noqa: E402
@@ -40,14 +41,27 @@ def prompts(B, S, seed):
     if args.random:
         g = torch.Generator().manual_seed(seed)
         return torch.randint(1000, 100000, (B, S), generator=g).tolist()
-    if _CORPUS is None:
-        import pydoc_data.topics as t
-        from transformers import AutoTokenizer
-
-        _CORPUS = AutoTokenizer.from_pretrained(args.model)(" ".join(t.topics.values()), add_special_tokens=False)["input_ids"]
     import random
 
     r = random.Random(seed * 7919 + B * 31 + S)
+    if args.corpus == "repeat":  # short pattern repeated: the nastiest case for near-ties and drafts
+        outp = []
+        for _ in range(B):
+            pat = [r.randrange(1000, 100000) for _ in range(r.randrange(3, 40))]
+            outp.append((pat * (S // len(pat) + 1))[:S])
+        return outp
+    if _CORPUS is None:
+        from transformers import AutoTokenizer
+
+        if args.corpus == "code":
+            import glob
+
+            text = chr(10).join(open(f, errors="ignore").read() for f in sorted(glob.glob("/usr/lib/python3*/**/*.py", recursive=True))[:300])
+        else:
+            import pydoc_data.topics as t
+
+            text = " ".join(t.topics.values())
+        _CORPUS = AutoTokenizer.from_pretrained(args.model)(text, add_special_tokens=False)["input_ids"]
     return [_CORPUS[o : o + S] for o in (r.randrange(0, len(_CORPUS) - S) for _ in range(B))]
 
 
@@ -105,6 +119,8 @@ for spec in args.shapes:
                     logits = baseline(full[b : b + 1], logits_to_keep=n).logits[0].float()  # [n, V]
                     gap = logits.max(-1).values - logits.gather(-1, toks[b].unsqueeze(-1)).squeeze(-1)
                     worst_gap = max(worst_gap, gap.max().item())
+                    for pos_ in (gap > 2.0).nonzero().flatten().tolist():
+                        print(f"   VIOLATION seq {b} step {pos_}/{n}: gap {gap[pos_].item():.3f} emitted {toks[b, pos_].item()} argmax {logits[pos_].argmax().item()}")
                     bad += (gap > 2.0).sum().item()
         print(f"   correctness: worst gap {worst_gap:.3f} logits, positions > 2.0: {bad}", flush=True)
         worst[spec] = worst_gap

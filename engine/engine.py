@@ -125,6 +125,23 @@ class _NG:
         return []
 
 
+class _Mixed:
+    """Diagnostics: fused ops with some groups swapped for the torch reference (ENGINE_OFF=attn,qkv,gemv)."""
+
+    GROUPS = {
+        "attn": ("attn_decode",),
+        "qkv": ("qkv_post",),
+        "gemv": ("linear", "gate_up_silu", "linear_add_norm"),
+    }
+
+    def __init__(self, fused, ref, off):
+        self.f, self.r = fused, ref
+        self.off = {name for g in off for name in self.GROUPS.get(g, ())}
+
+    def __getattr__(self, name):
+        return getattr(self.r if name in self.off else self.f, name)
+
+
 class _Layer:
     pass
 
@@ -149,6 +166,7 @@ class Engine:
         self._build_rope(ROPE_LEN)
         self.states = {}
         self._dbg = None
+        self._trace = None
         self.ops = _TorchOps(self)
         self.pool = torch.cuda.graph_pool_handle() if self.dev.type == "cuda" else None
         self.spec_ok = False
@@ -280,6 +298,8 @@ class Engine:
             h, a = ops.linear_add_norm(o, l.wo, h, l.ln2)
             m = ops.gate_up_silu(a, l.wgu)
             h, a = ops.linear_add_norm(m, l.wd, h, self.layers[i + 1].ln1 if i < last else self.norm)
+            if self._trace is not None:
+                self._trace.append(h.float().cpu())
         logits = ops.linear(a, self.lm_head)
         if self._dbg is not None:
             self._dbg.append(logits.float().cpu())
@@ -330,6 +350,8 @@ class Engine:
 
     def _selftest(self):
         """Fused ops vs torch ops on the real weights; keep fused only if close."""
+        if os.environ.get("ENGINE_OPS") == "torch":  # diagnostics: force the reference ops
+            return
         if TritonOps is None:
             print(f"[engine] fused ops unavailable: {_FUSED_ERR}")
             return
@@ -364,6 +386,9 @@ class Engine:
         diff = max((r - g).abs().max().item() for r, g in zip(ref, got))
         print(f"[engine] fused selftest max logit diff {diff:.4f}")
         self.ops = TritonOps(self) if diff <= 0.5 else _TorchOps(self)
+        off = [x for x in os.environ.get("ENGINE_OFF", "").split(",") if x]
+        if off and isinstance(self.ops, TritonOps):
+            self.ops = _Mixed(self.ops, _TorchOps(self), off)
 
     # --------------------------------------------------------------- generate
     @torch.inference_mode()
