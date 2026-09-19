@@ -112,7 +112,7 @@ def _qkv_post_kernel(
 
 @triton.jit
 def _attn_split_kernel(
-    q_ptr, k_ptr, v_ptr, pos_ptr, ws_ptr, cap, sm_scale,
+    q_ptr, k_ptr, v_ptr, pos_ptr, ws_ptr, out_ptr, cap, sm_scale,
     NSPLIT: tl.constexpr, G: tl.constexpr, GP: tl.constexpr, HD: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -147,10 +147,16 @@ def _attn_split_kernel(
         v = tl.load(v_ptr + kv_base + n[:, None] * HD + d[None, :], mask=nm[:, None], other=0.0)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m_i = m_new
-    wb = ((bk * G + rows) * NSPLIT + sp) * (HD + 2)
-    tl.store(ws_ptr + wb[:, None] + d[None, :], acc, mask=rmask[:, None])
-    tl.store(ws_ptr + wb + HD, m_i, mask=rmask)
-    tl.store(ws_ptr + wb + HD + 1, l_i, mask=rmask)
+    if NSPLIT == 1:
+        # One split needs no log-sum-exp merge or workspace allocation.
+        tl.store(out_ptr + (bk * G + rows[:, None]) * HD + d[None, :],
+                 (acc / l_i[:, None]).to(out_ptr.dtype.element_ty),
+                 mask=rmask[:, None])
+    else:
+        wb = ((bk * G + rows) * NSPLIT + sp) * (HD + 2)
+        tl.store(ws_ptr + wb[:, None] + d[None, :], acc, mask=rmask[:, None])
+        tl.store(ws_ptr + wb + HD, m_i, mask=rmask)
+        tl.store(ws_ptr + wb + HD + 1, l_i, mask=rmask)
 
 
 @triton.jit
@@ -223,8 +229,9 @@ GEMM_CFG = {
 
 
 class TritonOps:
-    def __init__(self, e):
+    def __init__(self, e, use_gemv=True):
         self.e = e
+        self.use_gemv = use_gemv
         assert e.hd & (e.hd - 1) == 0 and e.hd >= 2
         self.dummy_pos = torch.zeros(1, dtype=torch.long, device=e.dev)
 
@@ -271,23 +278,29 @@ class TritonOps:
         nsplit = 1
         while bk * nsplit < 256 and nsplit < 32:
             nsplit *= 2
-        ws = torch.empty((bk * G, nsplit, e.hd + 2), dtype=torch.float32, device=q.device)
         out = torch.empty((B, e.nh * e.hd), dtype=q.dtype, device=q.device)
+        ws = (out if nsplit == 1 else
+              torch.empty((bk * G, nsplit, e.hd + 2), dtype=torch.float32, device=q.device))
         _attn_split_kernel[(bk, nsplit)](
-            q, kc, vc, pos, ws, kc.shape[2], e.hd ** -0.5,
+            q, kc, vc, pos, ws, out, kc.shape[2], e.hd ** -0.5,
             NSPLIT=nsplit, G=G, GP=max(16, triton.next_power_of_2(G)), HD=e.hd,
             BLOCK_N=64, num_warps=4, num_stages=2,
         )
-        _attn_combine_kernel[(bk * G,)](
-            ws, out, NSPLIT=nsplit, SP=nsplit, HD=e.hd, num_warps=1
-        )
+        if nsplit > 1:
+            _attn_combine_kernel[(bk * G,)](
+                ws, out, NSPLIT=nsplit, SP=nsplit, HD=e.hd, num_warps=1
+            )
         return out
 
     def linear(self, x, w):
         M, K = x.shape
         N = w.shape[0]
         cfg = GEMM_CFG.get((N, K))
-        if cfg is None or M > 16 or not x.is_contiguous():
+        # These launch parameters and tl.dot arithmetic were tuned for bf16 on
+        # H100. Preserve full-precision behavior for fp32/fp16 callers.
+        if (not self.use_gemv or cfg is None or M > 16
+                or not x.is_contiguous() or not w.is_contiguous()
+                or x.dtype != torch.bfloat16 or w.dtype != torch.bfloat16):
             return torch.nn.functional.linear(x, w)
         BN, BK, SK, ST, NW = cfg
         kps = triton.cdiv(triton.cdiv(K, SK), BK) * BK

@@ -1,17 +1,20 @@
-"""Fused Triton ops vs torch ops. Run with TRITON_INTERPRET=1 (CPU) or on a GPU."""
+"""Fused Triton ops vs torch ops on a CUDA GPU."""
 import os
 import sys
 import types
 
-os.environ.setdefault("TRITON_INTERPRET", "1")
 import torch
+
+if os.environ.get("TRITON_INTERPRET") == "1":
+    raise RuntimeError("test_fused requires compiled CUDA kernels, not Triton interpretation")
+assert torch.cuda.is_available(), "test_fused requires a CUDA GPU"
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "engine"))
 from engine import _TorchOps, _Layer, _build_rope_tables  # noqa: E402
 from fused import TritonOps  # noqa: E402
 
-dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-bf = torch.bfloat16 if dev.type == "cuda" else torch.float32
+dev = torch.device("cuda")
+bf = torch.bfloat16
 torch.manual_seed(0)
 NH, NKV, HD, H, I = 8, 2, 128, 256, 192
 e = types.SimpleNamespace(dev=dev, eps=1e-6, nh=NH, nkv=NKV, hd=HD, dtype=bf)
@@ -40,8 +43,11 @@ close("silu_mul", tri.silu_mul(gu), tor.silu_mul(gu))
 l = _Layer()
 l.qn = torch.randn(HD, device=dev, dtype=bf)
 l.kn = torch.randn(HD, device=dev, dtype=bf)
-for B, S, pos in [(2, 6, None), (3, 1, torch.tensor([9], device=dev))]:
-    cap = 16
+for B, S, pos, cap in [
+    (2, 6, None, 16),
+    (3, 1, torch.tensor([9], device=dev), 16),
+    (3, 1, torch.tensor([63], device=dev), 64),
+]:
     qkv = torch.randn(B * S, (NH + 2 * NKV) * HD, device=dev, dtype=bf)
     out = {}
     for name, ops in (("torch", tor), ("triton", tri)):

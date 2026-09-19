@@ -20,7 +20,10 @@ engine/fused.py    Triton kernels + TritonOps (add+rmsnorm, qk-norm+rope+cache w
 tests/bench.py     GPU bench + correctness vs HF baseline (mimics platform)
 tests/prof.py      torch.profiler kernel table for one generate()
 tests/test_attn.py GPU: Triton attn vs SDPA
-tests/test_fused.py fused ops vs torch ops (CPU via TRITON_INTERPRET=1, or GPU)
+tests/test_prefill_last_query.py GPU: last-query prefill vs full causal attention
+tests/test_fused.py fused ops vs torch ops on CUDA GPU
+tests/test_selftest_fallback.py GPU: force bad GEMV and verify selective fallback
+tests/test_linear_precision.py GPU: GEMV dtype/layout fallback
 tests/test_vs_hf.py CPU: engine vs HF greedy on tiny random Qwen3 (fp32)
 tests/gemv_bench.py skinny-GEMM microbench, cuBLAS vs Triton
 ```
@@ -28,10 +31,11 @@ Only `engine/` is submitted. Keep notes/tools/tokens outside it.
 
 ## Engine design (what's in there)
 - **v1**: torch ops, static KV cache (`B x nkv x cap x hd`, cap rounded to 128), decode captured in a CUDA graph per `(B, cap)` (max 6 cached states), D2H copy + event per step so `yield` of step t-1 overlaps GPU step t. Prefill uses SDPA causal; only last token per seq goes to lm_head. Fused wqkv and gate|up weights.
+- **Current prefill**: the final layer computes attention for each sequence's last query only; that query attends to all prompt keys.
 - **v2** (`fused.py`): Triton fused add+rmsnorm, qk-norm+rope+KV write, silu*up. Mirrors ref bf16 rounding points.
 - **v3**: split-KV Triton decode attention (+combine kernel), reads `pos` from a device tensor (graph-safe).
 - **v4**: Triton split-K skinny GEMM for decode linears when M<=16; falls to `F.linear` for unlisted shapes / M>16 (`GEMM_CFG` in fused.py).
-- **Safety net**: `Engine._selftest()` runs torch ops vs fused ops on real weights at load (teacher-forced); uses fused only if max logit diff <= 0.5, else falls back to `_TorchOps`. Graph capture failure falls back to eager.
+- **Safety net**: `Engine._selftest()` runs torch ops vs fused ops on real weights at load (teacher-forced). If the full fused path exceeds 0.5 max logit diff, it retries fused ops with Torch GEMM before falling back to `_TorchOps`. Graph capture failure falls back to eager.
 - Ragged prompt lengths -> per-sequence fallback (slow; hidden workloads are presumably equal length).
 
 ## Results
@@ -39,6 +43,7 @@ Only `engine/` is submitted. Keep notes/tools/tokens outside it.
 |---|---|---|
 | v1 | **440.8** (#32) | B1 113.3, B4 233.2, B16 1464.1. TPOT 8.4-11.4 ms vs baseline 24-28 ms. TTFT B4 197 ms (~baseline). |
 | v2-v4 | fill in | on `main` (HEAD 8ff6a6c = v4); add official numbers here |
+| local work | unmeasured | last-query prefill, single-split attention output, and selective fused fallback; run GPU correctness and H100 timing before submission |
 
 Why: ~1800 launches/step unfused; prefill elementwise fp32-heavy. Next ideas: fewer launches, faster prefill (TTFT is a gate and counts in TPS), GEMM tuning, exact speculative decoding.
 
@@ -66,7 +71,7 @@ python tests/gemv_bench.py                                # GEMM microbench
 ```
 Bench correctness line: `worst gap` must stay <= 2.0 and `positions > 2.0: 0`. Watch `spread` <= 25%, and TPOT/TTFT vs baseline.
 
-No GPU? Logic-check Triton on CPU: `triton-windows`/triton + `TRITON_INTERPRET=1` (fp32, slow) via `tests/test_fused.py` and `tests/test_vs_hf.py`. Kernel perf and bf16 rounding still need the H100.
+No H100? Run the fused-op and attention correctness tests on another CUDA GPU; performance still needs the H100. The tiny HF comparison in `tests/test_vs_hf.py` can run on CPU.
 
 ## Submitting
 1. GitHub App connected to this repo (Repositories page, engine folder = `engine`, auto-run on).

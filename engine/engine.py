@@ -4,6 +4,7 @@ v2: fused Triton ops (fused.py) with load-time selftest + torch fallback.
 """
 import glob
 import json
+import math
 import os
 
 import torch
@@ -221,13 +222,17 @@ class Engine:
             q = ops.qkv_post(ops.linear(a, l.wqkv), l, kc, vc, B, S, pos)
             if decode:
                 o = ops.attn_decode(q, kc, vc, pos)
+            elif i == last:
+                # The final layer only contributes the last prompt position's
+                # logits. Its last query can attend to every cached key.
+                o = F.scaled_dot_product_attention(
+                    q[:, :, -1:, :], kc[:, :, :S], vc[:, :, :S], enable_gqa=True
+                ).transpose(1, 2).reshape(B, nh * hd)
+                h = h[S - 1::S].contiguous()
             else:
                 o = F.scaled_dot_product_attention(
                     q, kc[:, :, :S], vc[:, :, :S], is_causal=True, enable_gqa=True
                 ).transpose(1, 2).reshape(T, nh * hd)
-                if i == last:  # only each sequence's last token feeds the head
-                    idx = torch.arange(1, B + 1, device=self.dev) * S - 1
-                    o, h = o[idx], h[idx]
             h, a = ops.add_rms(h, ops.linear(o, l.wo), l.ln2)
             m = ops.silu_mul(ops.linear(a, l.wgu))
             nxt = self.layers[i + 1].ln1 if i < last else self.norm
@@ -251,39 +256,51 @@ class Engine:
             return
         torch.manual_seed(0)
         B, S, n = 2, 96, 4
-        ids = torch.randint(100, 5000, (B, S), device=self.dev)
-        run = {}
-        for name, ops in (("torch", _TorchOps(self)), ("fused", None)):
+        high = min(5000, self.embed.shape[0])
+        ids = torch.randint(min(100, high - 1), high, (B, S), device=self.dev)
+
+        def run(ops, reference_tokens=None):
+            self.ops = ops
             try:
-                self.ops = ops or TritonOps(self)
                 st = self._state(B, 128, graph=False)
-                self._dbg, toks, steps = [], [], []
+                self._dbg, toks = [], []
                 st.pos.fill_(S)
                 self._prefill(ids, st)
                 for t in range(n):
                     toks.append(st.tok.clone())
                     if t < n - 1:
-                        if name == "fused":  # teacher-force the reference tokens
-                            st.tok.copy_(run["torch"][1][t])
+                        if reference_tokens is not None:
+                            st.tok.copy_(reference_tokens[t])
                         self._decode_body(st)
-                run[name] = (self._dbg, toks)
-            except Exception as e:
-                print(f"[engine] fused selftest error: {e!r}")
-                self.ops = _TorchOps(self)
-                self._dbg = None
-                self.states.clear()
-                return
+                return self._dbg, toks
             finally:
                 self._dbg = None
                 self.states.clear()
-        ref, got = run["torch"][0], run["fused"][0]
-        diff = max((r - g).abs().max().item() for r, g in zip(ref, got))
-        print(f"[engine] fused selftest max logit diff {diff:.4f}")
-        self.ops = TritonOps(self) if diff <= 0.5 else _TorchOps(self)
+
+        fallback = _TorchOps(self)
+        try:
+            ref, reference_tokens = run(fallback)
+            for label, use_gemv in (("full", True), ("without GEMV", False)):
+                try:
+                    candidate = TritonOps(self, use_gemv=use_gemv)
+                    got, _ = run(candidate, reference_tokens)
+                    diffs = [(r - g).abs().max().item() for r, g in zip(ref, got)]
+                    diff = max(diffs) if all(math.isfinite(d) for d in diffs) else float("inf")
+                    print(f"[engine] fused {label} selftest max logit diff {diff:.4f}")
+                    if diff <= 0.5:
+                        self.ops = candidate
+                        return
+                except Exception as e:
+                    print(f"[engine] fused {label} selftest error: {e!r}")
+        except Exception as e:
+            print(f"[engine] fused selftest error: {e!r}")
+        self.ops = fallback
 
     # --------------------------------------------------------------- generate
     @torch.inference_mode()
     def generate(self, input_ids, max_new_tokens):
+        if max_new_tokens <= 0:
+            return
         B = len(input_ids)
         S = len(input_ids[0])
         if any(len(x) != S for x in input_ids):
