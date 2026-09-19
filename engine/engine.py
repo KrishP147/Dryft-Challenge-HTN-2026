@@ -154,8 +154,8 @@ class Engine:
         self.cos, self.sin = _build_rope_tables(self.theta, self.hd, n, self.dev, self.dtype)
 
     # ------------------------------------------------------------------ state
-    def _state(self, B, cap, graph=True):
-        key = (B, cap)
+    def _state(self, B, cap, graph=True, slot=None):
+        key = (B, cap, slot)
         st = self.states.get(key)
         if st is not None and (st.tried_graph or not graph):
             return st
@@ -311,7 +311,7 @@ class Engine:
         if cap > self.cos.shape[0]:
             self.states.clear()
             self._build_rope(cap)
-        st = self._state(B, cap)
+        st = self._state(B, cap, slot=S)
         self._host_bufs(st, n)
         ids = torch.tensor(input_ids, dtype=torch.long, device=self.dev)
         self._prefill(ids, st)
@@ -336,6 +336,17 @@ class Engine:
         yield host[n - 1].tolist()
 
     def _generate_ragged(self, input_ids, n):
-        outs = [[t[0] for t in self.generate([seq], n)] for seq in input_ids]
-        for t in range(n):
-            yield [o[t] for o in outs]
+        groups = {}
+        for i, seq in enumerate(input_ids):
+            groups.setdefault(len(seq), []).append(i)
+        streams = [
+            (indices, self.generate([input_ids[i] for i in indices], n))
+            for indices in groups.values()
+        ]
+        for _ in range(n):
+            step = [0] * len(input_ids)
+            for indices, stream in streams:
+                tokens = next(stream)
+                for i, token in zip(indices, tokens):
+                    step[i] = token
+            yield step

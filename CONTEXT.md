@@ -24,6 +24,7 @@ tests/test_prefill_last_query.py GPU: last-query prefill vs full causal attentio
 tests/test_fused.py fused ops vs torch ops on CUDA GPU
 tests/test_selftest_fallback.py GPU: force bad GEMV and verify selective fallback
 tests/test_linear_precision.py GPU: GEMV dtype/layout fallback
+tests/test_ragged_gpu.py GPU: interleaved ragged groups vs separate groups
 tests/test_vs_hf.py CPU: engine vs HF greedy on tiny random Qwen3 (fp32)
 tests/gemv_bench.py skinny-GEMM microbench, cuBLAS vs Triton
 ```
@@ -36,7 +37,7 @@ Only `engine/` is submitted. Keep notes/tools/tokens outside it.
 - **v3**: split-KV Triton decode attention (+combine kernel), reads `pos` from a device tensor (graph-safe).
 - **v4**: Triton split-K skinny GEMM for decode linears when M<=16; falls to `F.linear` for unlisted shapes / M>16 (`GEMM_CFG` in fused.py).
 - **Safety net**: `Engine._selftest()` runs torch ops vs fused ops on real weights at load (teacher-forced). If the full fused path exceeds 0.5 max logit diff, it retries fused ops with Torch GEMM before falling back to `_TorchOps`. Graph capture failure falls back to eager.
-- Ragged prompt lengths -> per-sequence fallback (slow; hidden workloads are presumably equal length).
+- Ragged prompt lengths -> group equal lengths and interleave decode steps; each group keeps its own KV state.
 
 ## Results
 | ver | official tok/s | notes |
