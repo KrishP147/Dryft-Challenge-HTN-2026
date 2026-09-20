@@ -530,6 +530,7 @@ for ptr in gemv_buffers:
 R_ROWS = 2
 R_COLS = int(os.environ.get("PROBE_REDUCE_COLS", "7"))
 R_SK = int(os.environ.get("PROBE_REDUCE_SPLITS", "2"))
+R_SCALE = float(os.environ.get("PROBE_REDUCE_RESIDUAL_SCALE", "1"))
 R_BLOCK = triton.next_power_of_2(R_COLS)
 R_WARPS = 8 if R_SK >= 4 else 4
 host_rws = (c.c_float * (R_SK * R_ROWS * R_COLS))(
@@ -537,7 +538,7 @@ host_rws = (c.c_float * (R_SK * R_ROWS * R_COLS))(
       (1 if col % 2 == 0 else -1) * (row + 1) * 0.03125
       for split in range(R_SK) for row in range(R_ROWS) for col in range(R_COLS)))
 host_rh = (c.c_uint16 * (R_ROWS * R_COLS))(
-    *(bf16((col - 3) * 0.25 + row * 0.125)
+    *(bf16(((col - 3) * 0.25 + row * 0.125) * R_SCALE)
       for row in range(R_ROWS) for col in range(R_COLS)))
 host_rw = (c.c_uint16 * R_COLS)(*(bf16(0.5 + col * 0.125) for col in range(R_COLS)))
 host_rhn = (c.c_uint16 * (R_ROWS * R_COLS))()

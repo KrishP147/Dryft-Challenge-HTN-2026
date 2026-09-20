@@ -26,7 +26,7 @@ tests/test_selftest_fallback.py GPU: force bad GEMV and verify selective fallbac
 tests/test_linear_precision.py GPU: GEMV dtype/layout fallback
 tests/test_ragged_gpu.py GPU: interleaved ragged groups vs separate groups
 tests/compile_triton_offline.py Linux: compile all fused kernel families for SM90 without GPU execution
-tests/probe_gpu_no_torch.py Linux: run fused SiLU, add+RMSNorm, last-query QKV prefill, direct/split attention, even-K/masked/split-K GEMV, and gate/up GEMV SiLU on a CUDA GPU through the driver, without PyTorch
+tests/probe_gpu_no_torch.py Linux: run fused SiLU, add+RMSNorm, last-query QKV prefill, direct/split attention, even-K/masked/split-K GEMV, gate/up GEMV SiLU, and split-K reduce/add/RMSNorm on a CUDA GPU through the driver, without PyTorch
 tests/test_vs_hf.py CPU: engine vs HF greedy on tiny random Qwen3 (fp32)
 tests/gemv_bench.py skinny-GEMM microbench, cuBLAS vs Triton
 ```
@@ -95,6 +95,8 @@ python tests/test_attn.py                                 # GPU attn vs SDPA
 python tests/test_fused.py                                # compiled CUDA kernels only
 python tests/compile_triton_offline.py                    # Linux + Triton 3.1, offline SM90 compile
 python tests/probe_gpu_no_torch.py                        # Linux + Triton 3.1 + NVIDIA GPU, torch-free fused precision probe
+PROBE_REDUCE_COLS=2560 PROBE_REDUCE_SPLITS=4 python tests/probe_gpu_no_torch.py  # production-width split-K epilogue
+PROBE_REDUCE_RESIDUAL_SCALE=5300 python tests/probe_gpu_no_torch.py  # large residual precision probe
 python tests/test_vs_hf.py                                # CPU, no model needed
 python tests/gemv_bench.py                                # GEMM microbench
 ```
