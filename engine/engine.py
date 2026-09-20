@@ -3,6 +3,7 @@
 v2: fused Triton ops (fused.py) with load-time selftest + torch fallback.
 """
 import glob
+import time
 import json
 import math
 import os
@@ -179,6 +180,14 @@ class Engine:
         if self.dev.type == "cuda":
             self._selftest()
             self._selftest_spec()
+        self._canary = 0.0
+        if self.dev.type == "cuda" and os.environ.get("ENGINE_CANARY", "0") == "1":
+            try:
+                from cudart import canary
+
+                self._canary = canary()
+            except Exception:
+                self._canary = 0.0
 
     # ---------------------------------------------------------------- weights
     def _load(self, model_path):
@@ -484,6 +493,8 @@ class Engine:
                 st.graph.replay()
             else:
                 self._decode_body(st)
+            if self._canary:
+                time.sleep(self._canary)
             host[t].copy_(st.tok, non_blocking=cuda)
             if cuda:
                 ev[t].record()
