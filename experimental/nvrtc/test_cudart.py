@@ -1,6 +1,6 @@
 """NVRTC + driver API smoke test: compile, load, launch (also inside a CUDA graph), check results."""
 import os, sys, time, torch
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "engine"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "."))
 import cudart
 print("canary delay (s):", cudart.canary())
 src = r'''

@@ -1,6 +1,6 @@
 # Dryft challenge: context for teammates
 
-Make Qwen3-4B decode faster on 1x H100, **output unchanged**. Score = geomean tok/s over 6 hidden workloads. Leaderboard: htn.dryft.ai. Top team ~1115 tok/s (as of Sep 19); we got 440.8 with v1.
+Make Qwen3-4B decode faster on 1x H100, **output unchanged**. Score = geomean tok/s over 6 hidden workloads. Leaderboard: htn.dryft.ai. Top team ~1144 tok/s (Sep 20); we are ~#6 at 1047.3. See `info.md` for current tasks.
 
 ## Rules (short)
 - Submit `engine/` only (engine.py + imported .py). Must export `Engine` with:
@@ -17,6 +17,9 @@ Make Qwen3-4B decode faster on 1x H100, **output unchanged**. Score = geomean to
 ```
 engine/engine.py   Engine: weight load, static KV, CUDA-graph decode, pipelined host sync, load-time selftest
 engine/fused.py    Triton kernels + TritonOps (add+rmsnorm, qk-norm+rope+cache write, silu*up, split-KV attn, skinny split-K GEMM)
+experimental/nvrtc/ NOT submitted: NVRTC runtime-CUDA launcher (rules unconfirmed, see info.md)
+tests/budget.py    per-kernel decode-step budget (run with ENGINE_PDL=0)
+tests/gemv_cfg_sweep.py in-engine GEMV config A/B with PDL
 tests/bench.py     GPU bench + correctness vs HF baseline (mimics platform)
 tests/prof.py      torch.profiler kernel table for full generation, prefill, or decode
 tests/test_attn.py GPU: Triton attn vs SDPA
@@ -49,12 +52,11 @@ Only `engine/` is submitted. Keep notes/tools/tokens outside it.
 | v3 | 866.4 | split-KV Triton decode attention (B1 pod 220, B4 465, B16 2765) |
 | v4 | 949.0 | Triton split-K skinny GEMM for decode linears (M<=16) |
 | v5 | 968.9 (#7) | fused split-K reduce+residual+rmsnorm; silu epilogue in gate/up GEMV |
-| v7 | pending | token-major prefill qkv kernel (no flash-output copy) |
-| merged local work | unmeasured | last-query final prefill, single-split direct attention, precision guards, ragged groups, selective fused fallback; run full-model correctness and H100 timing |
+| v7+ | merged | token-major prefill qkv kernel, last-query final prefill, single-split direct attention, precision guards, ragged groups, selective fused fallback |
 
 | v13 | 1035.2 | CUDA-graphed small prefills (flat on public shapes, helps short prompts) |
 | v14 | 1042.4 | mask-free GEMV (EVENK) + alignment hints |
-| v15 | pending (pod predicts 1053.7) | rope-table/graph-pool fix, attention stages=3, nsplit==1 combine skip for big grids (peer), score model |
+| v15 | **1047.3** best (draws 1041.1 / 1047.3 / 779.4, same build) | rope-table/graph-pool fix, attention stages=3, nsplit==1 combine skip for big grids (peer), score model |
 
 **Scoring model (exact, `tests/score_model.py`):** `score * metricMs / 1000 = 506.52223` on every run (15 digits), so the official score is exactly proportional to 1 / aggregate private time; the aggregate is a weighted throughput, so nothing can be inferred about the private token counts (an earlier note claiming their unweighted geomean is 506.5 was wrong). `log(score) = -0.266 + 0.142*log(B1 512->32 tok/s) + 0.449*log(B4 2048->32) + 0.444*log(B16 512->128)` fits all 11 runs to <0.8%. So 1% on B1 is worth ~0.14% of score and 1% on B4-2048 or B16-512 ~0.45%: **do not tune B1**. `tests/bench.py` now prints a predicted official score and % of bandwidth roofline (pod numbers run ~0.7% above the platform's). Leaders (Sep 20): SSS 1144, Silver Bullet 1138, dryfter 1137.
 
