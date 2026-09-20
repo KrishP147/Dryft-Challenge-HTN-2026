@@ -22,7 +22,7 @@ ap.add_argument("--samples", type=int, default=5)
 ap.add_argument("--no-check", action="store_true")
 ap.add_argument("--check-all", action="store_true", help="teacher-forced check on every sample")
 ap.add_argument("--random", action="store_true", help="random-token prompts instead of natural text")
-ap.add_argument("--corpus", default="pydoc", choices=["pydoc", "code", "repeat"], help="prompt source when not --random")
+ap.add_argument("--corpus", default="pydoc", choices=["pydoc", "code", "repeat", "prose"], help="prompt source when not --random")
 args = ap.parse_args()
 
 from engine import Engine  # noqa: E402
@@ -58,6 +58,34 @@ def prompts(B, S, seed):
             import glob
 
             text = chr(10).join(open(f, errors="ignore").read() for f in sorted(glob.glob("/usr/lib/python3*/**/*.py", recursive=True))[:300])
+        elif args.corpus == "prose":
+            # Natural prose, low repetition (unlike pydoc/code which overstate n-gram acceptance):
+            # a handful of distinct Gutenberg books, cached locally so repeat runs don't re-fetch.
+            import urllib.request
+
+            cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".prose_cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            urls = [
+                "https://www.gutenberg.org/cache/epub/1342/pg1342.txt",  # Pride and Prejudice
+                "https://www.gutenberg.org/cache/epub/11/pg11.txt",  # Alice in Wonderland
+                "https://www.gutenberg.org/cache/epub/84/pg84.txt",  # Frankenstein
+                "https://www.gutenberg.org/cache/epub/2701/pg2701.txt",  # Moby Dick
+                "https://www.gutenberg.org/cache/epub/1661/pg1661.txt",  # Sherlock Holmes
+                "https://www.gutenberg.org/cache/epub/76/pg76.txt",  # Huckleberry Finn
+            ]
+            texts = []
+            for i, u in enumerate(urls):
+                fp = os.path.join(cache_dir, f"book{i}.txt")
+                if not os.path.exists(fp):
+                    try:
+                        urllib.request.urlretrieve(u, fp)
+                    except Exception as e:
+                        print(f"   [prose corpus] fetch failed for {u}: {e!r}")
+                        continue
+                if os.path.exists(fp):
+                    texts.append(open(fp, errors="ignore").read())
+            assert texts, "prose corpus: no books fetched (no network?)"
+            text = "\n".join(texts)
         else:
             import pydoc_data.topics as t
 
