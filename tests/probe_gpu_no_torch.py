@@ -22,7 +22,7 @@ sys.modules["torch"] = torch_stub
 sys.path.insert(0, "engine")
 from fused import (  # noqa: E402
     _add_rms_kernel, _attn_combine_kernel, _attn_split_kernel,
-    _gemv_kernel, _gemv_silu_kernel, _qkv_post_prefill_kernel, _silu_mul_kernel,
+    _gemv_kernel, _gemv_silu_kernel, _qkv_post_kernel, _qkv_post_prefill_kernel, _silu_mul_kernel,
     _reduce_add_rms_kernel, _splitk_reduce_kernel,
 )
 
@@ -247,6 +247,88 @@ print(f"Last-query QKV prefill kernel: GPU correctness OK on SM{sm}")
 for ptr in buffers:
     call("cuMemFree_v2", ptr)
 call("cuModuleUnload", module)
+
+# Decode writes two tokens per batch row into different cache positions. The
+# query layout is [B, NKV, S, G, HD], unlike prefill's token-major layout.
+D_S, D_CAP = 2, 8
+D_TOTAL = (NH + 2 * NKV) * HD
+D_G = NH // NKV
+host_dqkv = (c.c_uint16 * (B * D_S * D_TOTAL))(
+    *(bf16(((i % 37) - 18) / 16) for i in range(B * D_S * D_TOTAL)))
+host_dpos = (c.c_int64 * B)(2, 4)
+dcos = [1.0, 1.0, 0.75, 1.0, 0.0, 0.75]
+dsin = [0.0, 0.0, 0.25, 0.0, 1.0, 0.25]
+host_dcos = (c.c_uint16 * (D_CAP * HD))(
+    *(bf16(dcos[p] if p < len(dcos) else 1.0) for p in range(D_CAP) for _ in range(HD)))
+host_dsin = (c.c_uint16 * (D_CAP * HD))(
+    *(bf16(dsin[p] if p < len(dsin) else 0.0) for p in range(D_CAP) for _ in range(HD)))
+host_dq = (c.c_uint16 * (B * NKV * D_S * D_G * HD))()
+host_dk = (c.c_uint16 * (B * NKV * D_CAP * HD))()
+host_dv = (c.c_uint16 * (B * NKV * D_CAP * HD))()
+decode_hosts = [host_dqkv, host_qn, host_kn, host_dcos, host_dsin,
+                host_dpos, host_dq, host_dk, host_dv]
+decode_buffers = [c.c_uint64() for _ in decode_hosts]
+for ptr, buf in zip(decode_buffers, decode_hosts):
+    call("cuMemAlloc_v2", c.byref(ptr), c.sizeof(buf))
+    call("cuMemcpyHtoD_v2", ptr, buf, c.sizeof(buf))
+source = ASTSource(
+    _qkv_post_kernel,
+    {**{i: "*bf16" for i in range(5)}, 5: "*i64",
+     **{i: "*bf16" for i in range(6, 9)},
+     9: "i32", 10: "i32", 11: "fp32"},
+    {12: NH, 13: NKV, 14: HD, 15: True, 16: 1, 17: False, 18: 0},
+)
+kernel = triton.compile(source, target=GPUTarget("cuda", sm, 32),
+                        options={"num_warps": 1, "num_stages": 1})
+binary = c.create_string_buffer(kernel.asm["cubin"])
+module = c.c_void_p()
+call("cuModuleLoadData", c.byref(module), binary)
+function = c.c_void_p()
+call("cuModuleGetFunction", c.byref(function), module, kernel.metadata.name.encode())
+arg_ds, arg_dcap, arg_deps = c.c_int(D_S), c.c_int(D_CAP), c.c_float(EPS)
+args = (c.c_void_p * 12)(*(c.addressof(p) for p in decode_buffers),
+                         c.addressof(arg_ds), c.addressof(arg_dcap), c.addressof(arg_deps))
+call("cuLaunchKernel", function, B * D_S, NH + 2 * NKV, 1, 32, 1, 1,
+     kernel.metadata.shared, None, args, None)
+call("cuCtxSynchronize")
+for ptr, buf in zip(decode_buffers[6:], decode_hosts[6:]):
+    call("cuMemcpyDtoH_v2", buf, ptr, c.sizeof(buf))
+
+def expected_decode_head(b, s, h):
+    t = b * D_S + s
+    off = t * D_TOTAL + h * HD
+    values = [from_bf16(host_dqkv[off + d]) for d in range(HD)]
+    var = sum(v * v for v in values) / HD
+    normed = [from_bf16(bf16(v / math.sqrt(var + EPS))) for v in values]
+    pos = host_dpos[b] + s
+    result = []
+    for d in range(HD):
+        partner = normed[d + HD // 2] if d < HD // 2 else normed[d - HD // 2]
+        signed = -partner if d < HD // 2 else partner
+        a = from_bf16(bf16(normed[d] * dcos[pos]))
+        cval = from_bf16(bf16(signed * dsin[pos]))
+        result.append(from_bf16(bf16(a + cval)))
+    return result
+
+for b in range(B):
+    for s in range(D_S):
+        pos = host_dpos[b] + s
+        for h in range(NH):
+            expected = expected_decode_head(b, s, h)
+            for d in range(HD):
+                dst = (((b * NKV + h // D_G) * D_S + s) * D_G + h % D_G) * HD + d
+                assert abs(from_bf16(host_dq[dst]) - expected[d]) < 0.03, ("decode Q", b, s, h, d)
+        for h in range(NKV):
+            expected = expected_decode_head(b, s, NH + h)
+            for d in range(HD):
+                dst = ((b * NKV + h) * D_CAP + pos) * HD + d
+                assert abs(from_bf16(host_dk[dst]) - expected[d]) < 0.03, ("decode K", b, s, h, d)
+                src = (b * D_S + s) * D_TOTAL + (NH + NKV + h) * HD + d
+                assert host_dv[dst] == host_dqkv[src], ("decode V", b, s, h, d)
+print(f"Decode QKV rotary/cache kernel: GPU correctness OK on SM{sm}")
+call("cuModuleUnload", module)
+for ptr in decode_buffers:
+    call("cuMemFree_v2", ptr)
 
 # At NSPLIT=1 the attention kernel writes directly into token-major output.
 # The second batch row crosses a 64-key tile boundary. Nonzero Q/K scores
