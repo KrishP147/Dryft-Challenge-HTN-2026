@@ -152,7 +152,11 @@ def _add_rms_kernel(
 
 @triton.jit
 def _silu_mul_kernel(gu_ptr, out_ptr, n, inter, BLOCK: tl.constexpr):
-    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    # int64 indexing: row * 2 * inter overflows int32 once rows*inter*2 > 2**31, i.e. prefill
+    # M = B*S beyond ~110k tokens at inter=9728. Confirmed as an illegal-memory-access crash at
+    # B256 S512 and B64 S2048 (both M=131072); prefill always takes this path, so any workload
+    # past that size kills the whole run. Widening the index changes no arithmetic or rounding.
+    idx = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
     m = idx < n
     row = idx // inter
     col = idx % inter
