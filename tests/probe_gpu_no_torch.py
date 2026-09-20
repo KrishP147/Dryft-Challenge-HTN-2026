@@ -527,7 +527,11 @@ for ptr in gemv_buffers:
 
 # The fused split-K epilogue rounds the split sum to BF16 before residual
 # addition, then rounds the normalized value before applying the RMS weight.
-R_ROWS, R_COLS, R_SK = 2, 7, 2
+R_ROWS = 2
+R_COLS = int(os.environ.get("PROBE_REDUCE_COLS", "7"))
+R_SK = int(os.environ.get("PROBE_REDUCE_SPLITS", "2"))
+R_BLOCK = triton.next_power_of_2(R_COLS)
+R_WARPS = 8 if R_SK >= 4 else 4
 host_rws = (c.c_float * (R_SK * R_ROWS * R_COLS))(
     *((col + 1) * 0.0625 if split == 0 else
       (1 if col % 2 == 0 else -1) * (row + 1) * 0.03125
@@ -547,10 +551,10 @@ source = ASTSource(
     _reduce_add_rms_kernel,
     {0: "*fp32", 1: "*bf16", 2: "*bf16", 3: "*bf16", 4: "*bf16",
      5: "i32", 6: "i32", 7: "fp32"},
-    {8: R_SK, 9: 128, 10: False, 11: 0},
+    {8: R_SK, 9: R_BLOCK, 10: False, 11: 0},
 )
 kernel = triton.compile(source, target=GPUTarget("cuda", sm, 32),
-                        options={"num_warps": 4, "num_stages": 1})
+                        options={"num_warps": R_WARPS, "num_stages": 1})
 binary = c.create_string_buffer(kernel.asm["cubin"])
 module = c.c_void_p()
 call("cuModuleLoadData", c.byref(module), binary)
@@ -559,7 +563,7 @@ call("cuModuleGetFunction", c.byref(function), module, kernel.metadata.name.enco
 arg_rows, arg_cols, arg_eps = c.c_int(R_ROWS), c.c_int(R_COLS), c.c_float(EPS)
 args = (c.c_void_p * 8)(*(c.addressof(ptr) for ptr in reduce_buffers),
                         c.addressof(arg_rows), c.addressof(arg_cols), c.addressof(arg_eps))
-call("cuLaunchKernel", function, R_ROWS, 1, 1, 128, 1, 1,
+call("cuLaunchKernel", function, R_ROWS, 1, 1, R_WARPS * 32, 1, 1,
      kernel.metadata.shared, None, args, None)
 call("cuCtxSynchronize")
 call("cuMemcpyDtoH_v2", host_rhn, reduce_buffers[3], c.sizeof(host_rhn))
@@ -581,7 +585,7 @@ for row in range(R_ROWS):
                                   from_bf16(host_rw[col])))
         actual = from_bf16(host_ry[idx])
         assert abs(actual - expected) < 0.02, ("reduce RMS", row, col, actual, expected)
-print(f"Fused split-K reduce/add/RMSNorm: GPU correctness OK on SM{sm}")
+print(f"Fused split-K reduce/add/RMSNorm (SK={R_SK}, N={R_COLS}): GPU correctness OK on SM{sm}")
 call("cuModuleUnload", module)
 for ptr in reduce_buffers:
     call("cuMemFree_v2", ptr)
