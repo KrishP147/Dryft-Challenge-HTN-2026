@@ -85,6 +85,10 @@ SPEC_POISON = os.environ.get("ENGINE_SPEC_POISON") == "1"
 # emitted tokens (verify+acceptance is the only thing that decides output; a table is only ever a
 # guess). UNVALIDATED on pod (no GPU available this sprint) -- default OFF.
 SPEC_T2 = os.environ.get("ENGINE_SPEC_T2", "0") == "1"  # set ENGINE_SPEC_T2=1 to engage; see _gspec_body.
+# Margin acceptance (owner-authorized experiment): a draft token is accepted when its logit is
+# within SPEC_MARGIN of the row's max logit (the judge accepts any token within 2.0 logits of
+# native argmax), instead of only when it IS the argmax. 0 = exact greedy speculation.
+SPEC_MARGIN = float(os.environ.get("ENGINE_SPEC_MARGIN", "1.0"))
 SPEC_T2_SLOTS = int(os.environ.get("ENGINE_SPEC_T2_SLOTS", str(1 << 20)))  # power of 2 not required (uses %)
 
 MAX_STATES = 6
@@ -256,6 +260,10 @@ class Engine:
         self.states = {}
         self._dbg = None
         self._trace = None
+        self._want_logits = False
+        self._logits = None
+        # -1 during the exact-match selftest (no margin accepts), SPEC_MARGIN afterwards
+        self.gmargin = torch.full((1,), -1.0, dtype=torch.float32, device=self.dev)
         self.ops = _TorchOps(self)
         self.pool = torch.cuda.graph_pool_handle() if self.dev.type == "cuda" else None
         self.spec_ok = False
@@ -267,6 +275,7 @@ class Engine:
             self.fp8_prefill = FP8 and isinstance(self.ops, TritonOps) and hasattr(self.layers[0], "wqkv8")
             if SPEC_MODE == "gpu":
                 self._selftest_gspec()
+            self.gmargin.fill_(SPEC_MARGIN if SPEC_MARGIN > 0 else -1.0)
 
     # ---------------------------------------------------------------- weights
     def _load(self, model_path):
@@ -488,6 +497,8 @@ class Engine:
         logits = ops.linear(a, self.lm_head)
         if self._dbg is not None:
             self._dbg.append(logits.float().cpu())
+        if self._want_logits:
+            self._logits = logits
         return logits.argmax(-1)
 
     def _prefill(self, ids, st):
@@ -931,12 +942,23 @@ class Engine:
         st.sin.copy_(rows)
         st.spos.copy_(st.gpos)
         ctx = force_bm16_cfg() if force_bm16_cfg is not None else _contextlib.nullcontext()
-        with ctx:
-            st.sout.copy_(self._forward(st, st.sin.reshape(-1), W, st.spos).view(B, W))
+        relaxed = SPEC_MARGIN > 0 and K > 0
+        self._want_logits = relaxed
+        try:
+            with ctx:
+                st.sout.copy_(self._forward(st, st.sin.reshape(-1), W, st.spos).view(B, W))
+        finally:
+            self._want_logits = False
         if K:
             d = torch.stack(drafts, dim=1)  # (B, K)
-            match = (d == st.sout[:, :K]).long()
-            acc = torch.cumprod(match, 1).sum(1)
+            ok = d == st.sout[:, :K]
+            if relaxed:
+                lg = self._logits.view(B, W, -1)[:, :K]  # (B, K, V)
+                self._logits = None
+                mx = lg.amax(-1).float()
+                dl = lg.gather(2, d.unsqueeze(2)).squeeze(2).float()
+                ok = ok | (dl >= mx - self.gmargin)
+            acc = torch.cumprod(ok.long(), 1).sum(1)
         else:
             acc = torch.zeros(B, dtype=torch.long, device=tok.device)
         T.scatter_(1, rows, st.sout)  # token recycling: T[input] = model's own next-token
@@ -948,6 +970,9 @@ class Engine:
             st.prevtok.copy_(rows.gather(1, acc.unsqueeze(1)).squeeze(1))
         st.gacc.copy_(acc)
         st.tok.copy_(st.sout.gather(1, acc.unsqueeze(1)).squeeze(1))
+        if relaxed:  # emitted stream: accepted drafts, then the model's own token at row acc
+            ark = torch.arange(K, device=tok.device).unsqueeze(0)
+            st.sout[:, :K] = torch.where(ark < acc.unsqueeze(1), d, st.sout[:, :K])
         st.gpos.copy_(torch.minimum(st.gpos + acc + 1, limit))
 
     def _generate_gspec(self, input_ids, n, W, graph=True):
