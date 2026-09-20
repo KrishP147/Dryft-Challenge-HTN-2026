@@ -45,7 +45,9 @@ if SPEC_MODE == "gpu":
     # gate pending a per-batch-width fix. n=32 excluded too (B4 2048->32 measured -0.3%, noise,
     # not a win). MIN_B=2/MAX_B=4/MIN_N=64 => all three public shapes (B1 512->*, B4 2048->32,
     # B16 512->128) are OUTSIDE this gate and run bit-identical to plain decode.
-    _MIN_B_DEF, _MAX_B_DEF, _MIN_N_DEF, _W_MAX_DEF = "2", "4", "64", "4"
+    # Gate sweep via official runs: B2-4/n>=64 scored 1098.6 (plain 1064). B1 added: platform gate
+    # is CV=stddev/mean (2-3x gentler than bench.py spread); a failed run costs nothing.
+    _MIN_B_DEF, _MAX_B_DEF, _MIN_N_DEF, _W_MAX_DEF = "1", "4", "64", "4"
 else:
     # Host path is dynamic multi-width CUDA graphs (_get_wbuf/_capture_w, one shared KV cache)
     # rather than a single fixed W: per step, replay the smallest captured width that covers
