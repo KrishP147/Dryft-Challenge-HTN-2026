@@ -26,7 +26,7 @@ CAP_GRAN = 128
 # 16384 measured no better. Audit shapes 1,8192,64 and 2,3000,32 clean at this cap.
 PREFILL_GRAPH_MAX = int(os.environ.get("ENGINE_PREFILL_GRAPH", "8192"))  # B*S at or below this: prefill runs as a CUDA graph (0 = off)
 SPEC = os.environ.get("ENGINE_SPEC", "1") == "1"  # exact n-gram speculation; engaged per the B/n policy below
-SPEC_W_MAX = int(os.environ.get("ENGINE_SPEC_W_MAX", "12"))  # verify width: 1 known + up to 11
+SPEC_W_MAX = int(os.environ.get("ENGINE_SPEC_W_MAX", "7"))  # verify width: 1 known + up to 11
                 # n-gram drafts. Raised from 7: at long outputs acceptance rises to 3+, so more
                 # drafts per verify => more tokens per weight-read. SPEC_ROWS=64 caps B*W, so W=12
                 # at B1-4, 8 at B8.
@@ -39,10 +39,10 @@ SPEC_ROWS = 64  # max B*W rows through the skinny GEMVs (raised from 16: BM_MAX=
 # Aggressive defaults (min batch 4, min output 96): only the best eligible official run counts,
 # so an unstable_timing failure costs one queue slot and nothing else, while B4's measured 2.32x
 # (CV 20%) is the largest win found tonight. SPEC_MIN_B=16 is the conservative fallback (CV ~5.5%).
-SPEC_MIN_B = int(os.environ.get("ENGINE_SPEC_MIN_B", "1"))
+SPEC_MIN_B = int(os.environ.get("ENGINE_SPEC_MIN_B", "4"))
 SPEC_MAX_B = int(os.environ.get("ENGINE_SPEC_MAX_B", "8"))  # B16 spec is dead: pod +0.1% (lockstep
                 # throttle + W=4) and public-2 512->128 went +16% slower officially. Exclude it.
-SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", "1"))  # aggressive length gate; paired here
+SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", "512"))  # aggressive length gate; paired here
                 # with wider verify width (SPEC_W_MAX=12) to test whether more drafts/verify boosts
                 # the long-output win.
 SPEC_W_OVERRIDE = os.environ.get("ENGINE_SPEC_W")  # force a specific W for the A/B sweep
