@@ -34,13 +34,17 @@ SPEC_W_MAX = int(os.environ.get("ENGINE_SPEC_W_MAX", "7"))  # verify width: 1 kn
                 # at B1-4, 8 at B8.
 SPEC_ROWS = 64  # max B*W rows through the skinny GEMVs (raised from 16: BM_MAX=64 now takes
                 # M<=64 on the fused path, so B16 gets W=4 and B4 gets W=7 instead of W=1)
-# Policy for which batches/output-lengths use speculation. B=1 has unfixable single-sequence
-# timing variance (min-over-1 has no averaging effect against a late-looping draw).
-# B16 spec is dead (pod +0.1%, public-2 512->128 went +16% slower officially) -- excluded.
+# Policy for which batches/output-lengths use speculation, per agent C's 6000-natural-window
+# drafter study: at B>=4 only K=1 (W=2) pays (decode speedup 1.03-1.10x, wider is pure overhead);
+# B8 is ~breakeven -> excluded, leave plain. Agent C's cost model says B1 K=3 (W=4) should be the
+# best regime pre-host-overhead, but measured in-engine (pod, prose corpus) it reproduces this
+# repo's already-documented "B=1 unfixable single-sequence timing variance": spread 12-23% (vs
+# ~0% for plain B1) against only a +0.3-2.6% mean gain -- a bad trade against the platform's CV
+# gate, so B1 stays excluded (SPEC_MAX_DRAFT_B1 below is wired but unreachable at this MIN_B).
 SPEC_MIN_B = int(os.environ.get("ENGINE_SPEC_MIN_B", "2"))
-SPEC_MAX_B = int(os.environ.get("ENGINE_SPEC_MAX_B", "8"))
+SPEC_MAX_B = int(os.environ.get("ENGINE_SPEC_MAX_B", "4"))
 # MIN_N=64: measured in-engine on natural prose (tests/bench.py --corpus prose), the dynamic-width
-# rewrite below still costs ~1-2% extra at B2/4/8, n=32-64 (host round-trip per step is inherent to
+# rewrite below still costs ~1-2% extra at B2/4, n=32-64 (host round-trip per step is inherent to
 # CPU-side drafting, can't fully hide behind the plain path's 1-step-behind pipeline) but is a wash
 # to +2.5% win at n>=96-128. 64 keeps EVERY public shape (B1 n32, B4 n32, B16 n128) out of spec
 # entirely -- MIN_B/MAX_B/MIN_N together make this a hidden-only lever with zero public risk, same
@@ -53,8 +57,12 @@ SPEC_W_OVERRIDE = os.environ.get("ENGINE_SPEC_W")  # force a single fixed W (ski
 # smallest captured width that covers the batch's drafts this step (width 1 when nobody has a
 # draft, so the no-draft step costs ~ the same as plain decode instead of paying a fixed wide W).
 SPEC_WIDTHS = sorted({int(x) for x in os.environ.get("ENGINE_SPEC_WIDTHS", "1,2,3,4").split(",") if x})
-SPEC_MIN_MATCH = int(os.environ.get("ENGINE_SPEC_MIN_MATCH", "3"))  # ignore 1/2-gram matches (junk drafts)
-SPEC_MAX_DRAFT = int(os.environ.get("ENGINE_SPEC_MAX_DRAFT", "1"))  # cap draft length (host + verify cost)
+# min_n=1: agent C's study measured the full 3/2/1-gram drafter at 1.16 accepted tok/step (first 32
+# tokens) vs 1.10 for an >=2-gram-only restriction -- 1-gram matches are noisy but still net
+# positive, so do NOT filter them out (overrides this file's earlier, unmeasured guess of 3).
+SPEC_MIN_MATCH = int(os.environ.get("ENGINE_SPEC_MIN_MATCH", "1"))
+SPEC_MAX_DRAFT = int(os.environ.get("ENGINE_SPEC_MAX_DRAFT", "1"))  # draft cap for B>=2 (K=1, W=2)
+SPEC_MAX_DRAFT_B1 = int(os.environ.get("ENGINE_SPEC_MAX_DRAFT_B1", "3"))  # draft cap for B==1 (K=3, W=4)
 SPEC_THROTTLE = int(os.environ.get("ENGINE_SPEC_THROTTLE", "1"))  # consecutive zero-accept drafts before cooldown
 SPEC_COOLDOWN = int(os.environ.get("ENGINE_SPEC_COOLDOWN", "8"))  # steps to stop drafting for that sequence
 # Measurement only (never set on the platform): drafts are replaced by ids that cannot match, so a
@@ -655,9 +663,12 @@ class Engine:
         output, plus one bonus token. B>1: the batch advances at the pace of its slowest sequence
         each step (lockstep yield), so the speedup is min_b(accepted/step), not the mean."""
         B, S = len(input_ids), len(input_ids[0])
-        # needed = 1 + len(draft) can never exceed 1 + SPEC_MAX_DRAFT, so any wider captured graph
+        # B==1 has no lockstep-min penalty (only one sequence), so a longer draft pays off there
+        # even though B>=2 only wants K=1 -- see agent C's per-B width study above.
+        max_draft = SPEC_MAX_DRAFT_B1 if B == 1 else SPEC_MAX_DRAFT
+        # needed = 1 + len(draft) can never exceed 1 + max_draft, so any wider captured graph
         # would be dead weight (never selected) -- drop them before capturing.
-        wreach = min(wcap, 1 + SPEC_MAX_DRAFT)
+        wreach = min(wcap, 1 + max_draft)
         widths = [w for w in SPEC_WIDTHS if 1 <= w <= wreach]
         if SPEC_W_OVERRIDE:
             widths = [max(1, min(int(SPEC_W_OVERRIDE), wcap))]
@@ -698,7 +709,7 @@ class Engine:
                     cool[b] -= 1
                     drafts.append([])
                 else:
-                    drafts.append(ng[b].draft(SPEC_MAX_DRAFT, SPEC_MIN_MATCH))
+                    drafts.append(ng[b].draft(max_draft, SPEC_MIN_MATCH))
             maxlen = max((len(d) for d in drafts), default=0)
             needed = 1 + maxlen
             w = next((x for x in widths if x >= needed), wmax)
