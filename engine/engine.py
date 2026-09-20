@@ -62,6 +62,7 @@ SPEC_MIN_B = int(os.environ.get("ENGINE_SPEC_MIN_B", _MIN_B_DEF))
 SPEC_MAX_B = int(os.environ.get("ENGINE_SPEC_MAX_B", _MAX_B_DEF))
 SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", _MIN_N_DEF))
 SPEC_W_MAX = int(os.environ.get("ENGINE_SPEC_W_MAX", _W_MAX_DEF))
+SPEC_W_WIDE = int(os.environ.get("ENGINE_SPEC_W_WIDE", "6"))  # gpu mode, B2-4 verify width
 SPEC_W_OVERRIDE = os.environ.get("ENGINE_SPEC_W")  # force a single fixed W (host mode: skip dynamic width choice)
 # --- host-mode dynamic multi-width spec knobs (see _generate_spec) ---
 SPEC_WIDTHS = sorted({int(x) for x in os.environ.get("ENGINE_SPEC_WIDTHS", "1,2,3,4").split(",") if x})
@@ -694,6 +695,9 @@ class Engine:
             W = max(1, min(W, SPEC_ROWS // B, SPEC_W_MAX))
             if SPEC_MODE == "gpu" and B > 4 and not SPEC_W_OVERRIDE:
                 W = 2  # B5-8: only one draft row pays (drafter sim: K=1 best at B>=4, M=16 rows)
+            elif SPEC_MODE == "gpu" and B >= 2 and not SPEC_W_OVERRIDE:
+                # official: W=2 at B4 scored 1112.9 vs W=4 1156.1 => the chain tail pays; go wider
+                W = max(W, min(SPEC_W_WIDE, SPEC_ROWS // B))
             if W >= 2:
                 if SPEC_MODE == "gpu" and self.gspec_ok:
                     yield from self._generate_gspec(input_ids, n, W)
