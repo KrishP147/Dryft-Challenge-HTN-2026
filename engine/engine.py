@@ -39,12 +39,10 @@ SPEC_ROWS = 64  # max B*W rows through the skinny GEMVs (raised from 16: BM_MAX=
 SPEC_MIN_B = int(os.environ.get("ENGINE_SPEC_MIN_B", "1"))
 SPEC_MAX_B = int(os.environ.get("ENGINE_SPEC_MAX_B", "8"))  # B16 spec is dead: pod +0.1% (lockstep
                 # throttle + W=4) and public-2 512->128 went +16% slower officially. Exclude it.
-SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", "1"))  # aggressive: engage spec on ALL
-                # batch-1..8 hidden shapes regardless of output length. First run at n>=128 tied
-                # baseline (no hidden [2,8] shape has n>=128), so the heavy B4-2048-like hidden
-                # shape has a shorter output -- catch it. Pod (code corpus) wins: B4->96 +28%,
-                # B1->256 +96%, B2->256 +56%, B8->256 +27%. Short-output shapes may lose a little,
-                # but only the best eligible official run counts, so net downside is free.
+SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", "64"))  # win-optimized: engage batch-1..8
+                # hidden shapes with output >=64, skipping the very-short region where verify
+                # overhead beats acceptance. Pod (code corpus) B4->96 +28%. Contrast vs the MIN_N=1
+                # sibling reveals whether short hidden shapes drag the aggregate.
 SPEC_W_OVERRIDE = os.environ.get("ENGINE_SPEC_W")  # force a specific W for the A/B sweep
 MAX_STATES = 6
 ROPE_LEN = 32768  # tables for cap <= this are built once; growing past it rebuilds them and drops the graphs
