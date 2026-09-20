@@ -25,7 +25,7 @@ CAP_GRAN = 128
 # eager (B4 17.4->16.6 GiB, B16 18.8->18.0 GiB) because graph-pool reuse beats ad-hoc allocation.
 # 16384 measured no better. Audit shapes 1,8192,64 and 2,3000,32 clean at this cap.
 PREFILL_GRAPH_MAX = int(os.environ.get("ENGINE_PREFILL_GRAPH", "8192"))  # B*S at or below this: prefill runs as a CUDA graph (0 = off)
-SPEC = os.environ.get("ENGINE_SPEC", "1") == "1"  # exact n-gram speculation; engaged per the B/n policy below
+SPEC = os.environ.get("ENGINE_SPEC", "0") == "1"  # exact n-gram speculation; engaged per the B/n policy below
 SPEC_W_MAX = 7  # verify width: 1 known token + up to 6 n-gram drafts
 SPEC_ROWS = 64  # max B*W rows through the skinny GEMVs (raised from 16: BM_MAX=64 now takes
                 # M<=64 on the fused path, so B16 gets W=4 and B4 gets W=7 instead of W=1)
