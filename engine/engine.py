@@ -97,7 +97,7 @@ SPEC_T2_SLOTS = int(os.environ.get("ENGINE_SPEC_T2_SLOTS", str(1 << 20)))  # pow
 MAX_STATES = 6
 ROPE_LEN = 32768  # tables for cap <= this are built once; growing past it rebuilds them and drops the graphs
 FP8 = os.environ.get("ENGINE_FP8", "1") == "1"  # tensorwise-fp8 prefill GEMMs (owner-authorized)
-FP8_OPS = set(os.environ.get("ENGINE_FP8_OPS", "qkv,gu").split(","))  # o/down bf16: residual writers
+FP8_OPS = set(os.environ.get("ENGINE_FP8_OPS", "qkv,gu,o,down").split(","))  # o/down bf16: residual writers
 FP8_MAX_B = int(os.environ.get("ENGINE_FP8_MAX_B", "8"))  # B16 fp8 flips the massive activation -> gate fail
 # NOTE: fp8 prefill GEMMs were removed here, deliberately, twice. They are fast and they pass the
 # 2-logit replay gate, but the contract forbids them outright ("Quant/approx forbidden", and
