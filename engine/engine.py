@@ -66,6 +66,12 @@ class _TorchOps:
         g, u = gu.chunk(2, -1)
         return F.silu(g) * u
 
+    def attn_prefill(self, q, kc, vc, S, last_query_only=False):
+        e = self.e
+        return F.scaled_dot_product_attention(
+            q, kc[:, :, :S], vc[:, :, :S], is_causal=not last_query_only, enable_gqa=True
+        ).transpose(1, 2).reshape(-1, e.nh * e.hd)
+
     def attn_decode(self, q, kc, vc, pos, W=1):
         e = self.e
         B, cap = q.shape[0], kc.shape[2]
@@ -136,6 +142,7 @@ class _Mixed:
 
     GROUPS = {
         "attn": ("attn_decode",),
+        "attnp": ("attn_prefill",),
         "qkv": ("qkv_post",),
         "gemv": ("linear", "gate_up_silu", "linear_add_norm"),
     }
@@ -308,14 +315,10 @@ class Engine:
             if decode:
                 o = ops.attn_decode(q, kc, vc, pos, S)
             elif i == last:
-                o = F.scaled_dot_product_attention(
-                    q, kc[:, :, :S], vc[:, :, :S], enable_gqa=True
-                ).transpose(1, 2).reshape(B, nh * hd)
+                o = ops.attn_prefill(q, kc, vc, S, last_query_only=True)
                 h = h[S - 1::S].contiguous()
             else:
-                o = F.scaled_dot_product_attention(
-                    q, kc[:, :, :S], vc[:, :, :S], is_causal=True, enable_gqa=True
-                ).transpose(1, 2).reshape(T, nh * hd)
+                o = ops.attn_prefill(q, kc, vc, S)
             h, a = ops.linear_add_norm(o, l.wo, h, l.ln2)
             m = ops.gate_up_silu(a, l.wgu)
             h, a = ops.linear_add_norm(m, l.wd, h, self.layers[i + 1].ln1 if i < last else self.norm)
