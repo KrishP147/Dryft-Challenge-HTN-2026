@@ -1,74 +1,123 @@
-# info: work brief for Juan (worker-agent mode)
+# info — S6 `glue-verify`: worker brief for Juan
 
-You = worker. Krish = owner/decider. Read `CONTEXT.md` first (rules, design, every result). This file = what to run/try/implement next. Don't redo anything in "Dead levers".
+You = worker agent. Krish = owner/decider. A separate Opus session = orchestrator; it merges every
+worker's branch and does all pushes to `main`.
 
-## State (Sep 20)
-- Best official **1047.3** (#6/43). Leaders: 1144 / 1139 / 1138. Plateau: last 3 pushes moved score ~0.
-- `main` engine == build `1e460f5` (draws 1041.1 / 1047.3 / 779.4). Decode TPOT identical to 0.01 ms across all draws; the variance is a **prefill/TTFT tail** (platform contention). Private set is prefill-heavy.
-- Score: `score * metricMs / 1000 = 506.52223` (exact). Regime weights on public tok/s: B1 0.14, **B4 2048->32 0.45**, **B16 512->128 0.44**. Never tune B1. Private set likely has no B>=32, none with B*S<=4096.
-- Decode step (B16, PDL off, 4192 us): small GEMVs 42.6%, gate_up+silu 31%, attn split 14.9%, reduce+add+rms 5.1%, qkv_post 2%, combine 1.5%. Launch gaps only 2.2%. Gap to roofline ~30%, ~15% of it = small GEMVs at 1.8-2.4 TB/s vs lm_head 3.08 TB/s (per-launch ramp).
+**Read `handoffs/SHARED-CONTEXT.md` first** (scoreboard, rules stance, protocol, dead levers,
+correctness bar, profiling traps — all of it applies to you), then `CONTEXT.md` (design and full
+experiment history). This file is only what *you* own.
 
-## Protocol (hard rules)
-1. Branch `juan/<name>` (never commit experiments to `main`).
-2. **Push to `main` = official run** (serial queue, ~7-10 min, counts). Push only when: pod A/B (5 samples) shows >= +1.5% predicted score AND `python tests/bench.py --check-all` clean (worst gap <= 2.0, 0 positions > 2.0, spread <= 25%). Before push: `git fetch && git merge origin/main`.
-3. Decide with pod A/B in the **real engine** (PDL on), not microbench. Isolated microbenches pointed wrong twice. Official runs can't resolve <1% and have a left tail; never trust one.
-4. Don't add numeric drift (bf16 rounding points, reduction order). Massive-activation bistability: any drift flips it at large B. Selftest/fallback in `Engine._selftest` must cover any new fused op.
-5. `engine/` = only thing submitted. Triton/Python source only, no binaries/network. **No NVRTC/CUDA-string code in `engine/`** until Krish confirms organizers allow it (task 0). Prototype in `experimental/`.
-6. Nothing secret in git. Team token lives in `~/.dryft_token`.
-7. Report each task: branch, commit, pod A/B table (before/after, 5 samples, spread), check-all result, verdict (keep/kill). Negative results get appended to CONTEXT.md "Findings" (short, with numbers).
+> This file used to be the general task list (T0-T5). **That version is superseded.** T0 (the
+> organizer rules question) is closed — the owner's stance is now "if the platform accepts the
+> submission, it is allowed", and agent S3 is confirming it with a real push. T1 (prefill) is agent
+> S5's. T2 (small-GEMV ramp) is agents S1/S2/S3's. T3/T4 (grid barrier, CUDA GEMV) are agents
+> S4/S3's. **Do not work those** — you would duplicate five other agents' hours.
 
-## Setup
-RunPod H100 SXM (~$3.5/h, stop when idle). Recipe in `CONTEXT.md` > Local dev. Krish's pod `6ewaafott6x3hh` is stopped; ask before starting it. Use `flock /workspace/gpu.lock` on shared pod. `export TRITON_CACHE_DIR=/workspace/triton_cache`.
+## Who is doing what (so you don't collide)
 
-## Tasks (priority order)
+| agent | owns | do not touch |
+|---|---|---|
+| S1 `gemv-balance` | `_gemv_kernel`, `GEMM_CFG`, `TritonOps.linear` / `linear_add_norm` | — |
+| S2 `mlp-attn-balance` | `_gemv_silu_kernel`, `SILU_CFG`, `gate_up_silu`, `_attn_split_kernel`, `_attn_combine_kernel`, `attn_decode` | — |
+| S3 `nvrtc-gemv` | `engine/cudart.py`, CUDA GEMV, the platform-acceptance probe push | — |
+| S4 `megakernel` | `experimental/mk/`, `engine/mk.py` | — |
+| S5 `prefill` | `Engine._prefill`, `_capture_prefill`, `_qkv_post_prefill_kernel`, flash prefill | — |
+| **S6 (you)** | **the decode glue kernels, the safety net, and verification — below** | everything above |
 
-### T0. Rules gate (Krish does; you're blocked on CUDA tasks until answered)
-Question for organizers: "is runtime-compiled CUDA C++ via NVRTC in a .py string allowed?". Starter guide says Triton/Python source only, no cubin/PTX/.so. If **no**: skip T3/T4, Triton headroom ~0-1%, stop after T1/T2.
+**Your region, exactly:** `_reduce_add_rms_kernel`, `_add_rms_kernel`, `_splitk_reduce_kernel`,
+`_qkv_post_kernel` (the **decode** one, not the prefill one), `_silu_mul_kernel`, and their
+`TritonOps` wrappers (`rms`, `add_rms`, `silu_mul`, `qkv_post`, `_rms_launch`); plus
+`Engine._selftest`, `_Mixed`, `_TorchOps`, `_state`, `_host_bufs`, `MAX_STATES`.
 
-### T1. Prefill speed (highest expected value, Triton-only, no rules risk)
-Why: prefill ~48% of B4 regime (TTFT ~112 ms @ B4x2048; attention ~19.6 ms, GEMM ~740 TFLOP/s vs cuBLAS 756 peak-ish). Also shrinks exposure to the TTFT tail.
-Run:
-```bash
-python tests/prof.py 4 2048 32 --phase prefill     # kernel table
-python tests/bench.py --shapes 4,2048,32 --no-check
-python tests/prof_prefill.py ; python tests/flash_prefill.py
-```
-Try, in order:
-1. Prefill attention: tune Triton flash kernel (BLOCK_M/N, num_warps, num_stages, causal block-skip, exp2 softmax, q-token-major layout) in `engine/fused.py`. Target: attention 19.6 ms -> <= 15 ms. Sweep in-engine.
-2. Non-GEMM prefill overhead (~19% cut already by token-major qkv): re-profile; look for remaining elementwise/copy kernels (add+rmsnorm at M=8192, silu*up, rope/cache write). Anything not at ~3 TB/s is a target.
-3. Mid sizes (B16 512 = M 8192 too): check GEMM shapes pick best cuBLAS algo; try `torch.backends.cuda.matmul` knobs only if output stays exact.
-Accept: B4 TTFT -5% or better in pod A/B, check-all clean.
+If a change would touch someone else's region, **route it through the orchestrator** — don't edit it.
 
-### T2. Small-GEMV ramp (decode, Triton-only)
-Goal: close part of the 14.7% small-GEMV gap. Ideas NOT yet tried (everything in Dead levers is excluded):
-- Merge o-proj GEMV with the following reduce+add+rms so o (1761 GB/s, worst) loses one launch/ramp (careful: split-K reduce needs all CTAs; measure with `tests/budget.py`).
-- Batch independent GEMVs into one launch (e.g. q/k/v already fused; try o+nothing? check for any two GEMVs with no dependency between them per layer; likely none, then skip).
-- Split-K factor per shape to raise CTA count for o/down/qkv (grid 80-320 CTAs on 132 SMs; try nsplit that gives 2-4 waves).
-Run: `ENGINE_PDL=0 python tests/budget.py 16,512,128`; `python tests/gemv_cfg_sweep.py {qkv,o,down,gate_up,pf}`.
-Accept: >= +1.5% pod geomean.
+## J0. Verification service — standing duty, highest value
 
-### T3. Grid-barrier go/no-go probe (pod only, NO push; needs T0 = yes)
-Measure cost of ONE grid barrier and whether a cooperative launch is capturable in a CUDA graph. Use `experimental/nvrtc/cudart.py` (`compile_cubin`, `Module`, `Kernel.__call__`; smoke test `experimental/nvrtc/test_cudart.py`).
-- Kernel: 132 CTAs x N threads, loop 1000 barriers (atomic counter spin, and `cuLaunchCooperativeKernel` variant), report us/barrier.
-- Go rule: <= ~1.5 us/barrier (~288 barriers/step). Otherwise megakernel can't win (persistent GEMV was -4%, atomic combine -2%). Write result to CONTEXT.md.
+Five agents are optimising in parallel against a **05:00 ET feature freeze**, and each push to `main`
+costs a serial queue slot. You are the only independent check between a worker's claim and a push.
 
-### T4. CUDA GEMV prototype (only if T0=yes and T3=go, or as stand-alone)
-mma.sync m16n8k16 bf16 GEMV with PDL prologue issuing first W stages (cp.async) before `griddepcontrol.wait`. Design notes: K-permutation so each thread takes one 16 B W load + one 16 B x load per 32-k block; stage x in smem once; CTAs ~64 rows, 8 warps; keep split-K partials + `_reduce_add_rms_kernel`; fp32 accumulate, bf16 outputs; hook into selftest.
-Falsify cheap first: 1-kernel prototype must beat Triton qkv GEMV (13.4 us) by >= 10% in `tests/gemv_bench.py`-style timing, else kill. Expect <0.5% (PF result says early weight start is exhausted).
+When the orchestrator hands you a branch or patch: apply it to a clean tree on **your** pod and
+re-run, from scratch:
+- `python tests/bench.py` — 5 samples, B1/B4/B16, predicted score, **spread**, before vs after;
+- `python tests/bench.py --check-all` on the 3 public shapes **and**
+  `--shapes 32,512,128 64,512,128 8,1024,64 2,3000,32 16,2048,128 1,8192,64`, plus `--corpus code`
+  and `--corpus repeat`;
+- confirm the decode graph still **captures** (a capture failure degrades silently to eager and only
+  shows up as a slow official run — check `eng.states[...].graph is not None`);
+- confirm peak memory stays under 90% of 80 GB at B16 and B64.
 
-### T5. Large-batch correctness risk (low priority, only if time)
-B32 code corpus: 3.9-logit violation (seq 24 step 85); B64 natural: 3.25 (seq 0 step 99). Identical on v14/v15, native control clean (`tests/native_gap.py` gives 1.0). Needs BOTH fused attn and fused qkv (`ENGINE_OFF=attn` or `=qkv` pass). Bisect further with `tests/trace_diff2.py`, `tests/trace_prefill.py`. Only matters if a private workload has B>=32. Fix must not slow B<=16.
+Report **pass/fail plus the numbers**, not a judgement call on whether to ship — the orchestrator
+decides that. A disagreement between your A/B and the author's is itself the finding; say so plainly
+rather than averaging them.
 
-## Dead levers (measured, don't repeat)
-PF/L2 prefetch depth (PF=4 best, 32 = -14%) | GEMV tile/stage/warp configs (255 swept, +0.0-0.1%) | mask-free GEMV (+0.7%) | FMA GEMV / FMA attention | GEMV re-tiling | persistent SM-balanced GEMV (-4 to -10%) | fused last-block attn combine (-2%) | qkv_post into GEMV epilogue | Triton fused SiLU prefill GEMM (-10%) | cuDNN SDPA prefill | n-gram spec decode (net loss on platform prompts; `ENGINE_SPEC` off) | RMSNorm-in-GEMV-prologue (slower) | nsplit==1 combine skip (0 on private set) | CUDA-graph small prefills (flat) | reruns as "improvement" (lottery, Krish decides).
+Interleave J1 between verification requests. Verification wins when they conflict.
 
-## Profiling traps
-- PDL on: waiting kernel gets charged for producer's time (sum reads 124-131% of step). Attribute with `ENGINE_PDL=0`.
-- Graph re-capture needs fresh `torch.cuda.graph_pool_handle()`.
-- `budget.py` replays `pos += 1`; rewind `st.pos` or attention reads past cap (illegal access).
-- KV init `zeros` not `empty`. Tensors read in-graph must be persistent buffers.
+## J1. Decode glue latency — your perf task (~300 us = 7% of the step)
 
-## Unresolved (Krish)
-- Organizers' answer on NVRTC?
-- GPU budget for T3/T4?
-- OK to spend official runs on reruns?
+From `tests/budget.py` (B16 512->128, PDL off, 4192 us step):
+
+| kernel | us/step | % | launches/step |
+|---|---|---|---|
+| `_reduce_add_rms_kernel` | 215 | 5.1% | 72 |
+| `_qkv_post_kernel` | 84 | 2.0% | 36 |
+
+These are **latency-bound, not bandwidth-bound**, and that is the thing to attack. `_reduce_add_rms`
+runs **one program per row** — at B16 that is a grid of **16 CTAs on 132 SMs (12% occupancy)**,
+moving well under 1 MB, at ~3 us per launch. Nearly all of that 3 us is ramp, not work.
+
+Lines of attack, cheapest first:
+1. **More parallelism per launch.** One CTA per row wastes the machine. The RMSNorm needs a whole-row
+   sum, so a naive column split needs a cross-CTA reduction — but the *residual add* and the `hn`
+   store do not. Consider splitting the work so the add/store fan out while the norm stays per-row,
+   or widening the per-row program (warps/BLOCK) so the single wave finishes sooner.
+2. **Fewer launches.** 72 + 36 = 108 launches at ~2-3 us each is a hard floor of ~250 us. Look for
+   two adjacent glue ops with no dependency between them that can share one launch.
+3. **Re-measure after S1 lands.** S1 is moving the GEMVs to **SK=1** (perfect row balance removes the
+   reason split-K existed), which **deletes `_splitk_reduce_kernel` entirely and turns
+   `_reduce_add_rms` into a plain add+rms**. Some of your 215 us evaporates for free. Coordinate with
+   the orchestrator on S1's landing before you invest hours here — and make whatever you build
+   correct at **both** SK=1 and SK>1, because S1 might not land.
+
+**Already dead in this area, do not repeat** (see `handoffs/SHARED-CONTEXT.md` for the full list):
+RMSNorm fused into the GEMV *prologue* (slower — serialises a pass over x before weight loads);
+`qkv_post` folded into the GEMV epilogue or into attention; the fused last-block attention combine via
+an atomic counter (-2%). What *did* work historically was fusing the split-K reduce + residual + norm
+into one kernel — that is the kernel you now own.
+
+Ship bar: **>= +1.5% predicted score geomean** in a 5-sample in-engine pod A/B, behind an env gate
+that defaults **off**, with `--check-all` clean.
+
+## J2. Large-batch correctness — insurance
+
+B32 on the code corpus gives a **3.9**-logit violation (seq 24 step 85); B64 natural gives **3.25**
+(seq 0 step 99). Identical on v14 and v15; the native decode-vs-replay control is 1.0 at B64.
+Cause: a bistable massive activation (|h| ~ 5300 at layer ~16) that any rounding difference flips.
+It needs **both** the fused attention and the fused qkv path (`ENGINE_OFF=attn` or `=qkv` each pass).
+Bisect further with `tests/trace_diff2.py` and `tests/trace_prefill.py`.
+
+All official runs have passed and the private set probably has no batch >= 32 (the nsplit==1 change
+that only fires at B>=32 moved the score by exactly 0). So this is **insurance, not a win** — but an
+`incorrect_output` on one private workload fails the whole run. Any fix must not slow B<=16.
+
+**Priority: below J0 and J1.** Do it if you have spare time, or immediately if the orchestrator tells
+you a new lander made a large-batch gap worse.
+
+## J3. Load-time preparation — on orchestrator request only
+
+Engine load and warmup are **untimed** (300 s budget; `max_compile_seconds` is 600). Nobody owns this
+budget. If S3 or S4 land, they may need weights repacked into a permuted or tiled layout at load time
+— that is free real estate, and it is yours to build when asked. Do not start it speculatively; the
+one thing already tried and dropped here is pre-warming every shape in `__init__` (`cebcf22`).
+
+## Reporting
+
+Branch `krish/glue-verify` on your own pod. **Never push to `main`; never edit the Windows checkout**
+(another session is live in it). Hand back a diff (`git diff base > /workspace/w/glue-verify.patch`)
+and paste it in your report — see `handoffs/SHARED-CONTEXT.md` > "Getting the code onto your pod" for
+the credential-free setup.
+
+Per task: branch, commit, pod A/B table (5 samples, before/after, spread), `--check-all` result per
+shape, verdict keep/kill, one-line reason. Every negative result with numbers — the orchestrator
+appends it to `CONTEXT.md` > Findings.
+
+**Open questions for Krish are the orchestrator's to carry now. Send them there, not here.**
