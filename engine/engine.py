@@ -48,7 +48,7 @@ if SPEC_MODE == "gpu":
     # B16 512->128) are OUTSIDE this gate and run bit-identical to plain decode.
     # Gate sweep via official runs: B2-4/n>=64 scored 1098.6 (plain 1064). B1 added: platform gate
     # is CV=stddev/mean (2-3x gentler than bench.py spread); a failed run costs nothing.
-    _MIN_B_DEF, _MAX_B_DEF, _MIN_N_DEF, _W_MAX_DEF = "1", "4", "64", "4"
+    _MIN_B_DEF, _MAX_B_DEF, _MIN_N_DEF, _W_MAX_DEF = "1", "8", "64", "4"
 else:
     # Host path is dynamic multi-width CUDA graphs (_get_wbuf/_capture_w, one shared KV cache)
     # rather than a single fixed W: per step, replay the smallest captured width that covers
@@ -84,7 +84,7 @@ SPEC_POISON = os.environ.get("ENGINE_SPEC_POISON") == "1"
 # handled identically to an empty slot -- always falls back to T[v], so this can never change
 # emitted tokens (verify+acceptance is the only thing that decides output; a table is only ever a
 # guess). UNVALIDATED on pod (no GPU available this sprint) -- default OFF.
-SPEC_T2 = os.environ.get("ENGINE_SPEC_T2", "1") == "1"  # set ENGINE_SPEC_T2=1 to engage; see _gspec_body.
+SPEC_T2 = os.environ.get("ENGINE_SPEC_T2", "0") == "1"  # set ENGINE_SPEC_T2=1 to engage; see _gspec_body.
 SPEC_T2_SLOTS = int(os.environ.get("ENGINE_SPEC_T2_SLOTS", str(1 << 20)))  # power of 2 not required (uses %)
 
 MAX_STATES = 6
@@ -681,6 +681,8 @@ class Engine:
         if self.spec_ok and SPEC and SPEC_MIN_B <= B <= SPEC_MAX_B and n >= SPEC_MIN_N:
             W = int(SPEC_W_OVERRIDE) if SPEC_W_OVERRIDE else min(SPEC_W_MAX, SPEC_ROWS // B)
             W = max(1, min(W, SPEC_ROWS // B, SPEC_W_MAX))
+            if SPEC_MODE == "gpu" and B > 4 and not SPEC_W_OVERRIDE:
+                W = 2  # B5-8: only one draft row pays (drafter sim: K=1 best at B>=4, M=16 rows)
             if W >= 2:
                 if SPEC_MODE == "gpu" and self.gspec_ok:
                     yield from self._generate_gspec(input_ids, n, W)
