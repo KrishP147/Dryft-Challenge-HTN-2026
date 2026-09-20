@@ -695,6 +695,56 @@ GEMM_CFG = {
 # gate/up + silu epilogue tile configs: (BN, BK, stages, warps)
 SILU_CFG = {(9728, 2560): (32, 128, 3, 2)}
 
+# BM=64 overrides: the BM=16 tile configs above exceed the 232448-byte shared-memory limit at
+# BM=64 (roughly num_stages * (BM+BN) * BK * 2 bytes for the staged bf16 operand tiles). SK is
+# left unchanged vs the BM=16 entry for each shape so this only changes tile discretization, not
+# the split-K reduction order (a correctness concern independent of BM). Shapes not listed here
+# (down, gate_up) already fit the BM=16 config's footprint at BM=64 and need no override.
+GEMM_CFG_64 = {
+    # only 'o' actually overflows shared memory at BM=64 with its BM=16 config
+    # (4 stages * (64+64)*256*2 bytes = 262144 > 232448 limit); qkv and lm_head fit
+    # unchanged (163840 and 196608 bytes respectively) and are deliberately NOT
+    # overridden here so they keep their tuned BK -- cutting BK there was tested and
+    # measurably worse (see report). SK unchanged (2) to preserve reduction order.
+    (2560, 4096): (64, 256, 2, 3, 4),
+}
+SILU_CFG_64 = {}
+
+
+# BM=128: shared-memory need grows again (roughly stages*(BM+BN)*BK*2), so qkv/o/lm_head need
+# a further cut beyond their BM=64 fix (down, gate_up still fit unchanged). Cut num_stages only
+# (not BN/BK) to keep the K-tiling identical to the tuned BM=16 shape; SK unchanged throughout.
+GEMM_CFG_128 = {
+    (6144, 2560): (64, 128, 1, 4, 4),    # qkv: 4*(128+64)*128*2 = 196608, fits
+    (2560, 4096): (64, 256, 2, 2, 4),    # o: 2*(128+64)*256*2 = 196608, fits
+    (151936, 2560): (64, 256, 1, 2, 4),  # lm_head: 2*(128+64)*256*2 = 196608, fits
+}
+SILU_CFG_128 = {}
+
+
+def _gemm_cfg(N, K, bm):
+    if bm >= 128:
+        c = GEMM_CFG_128.get((N, K))
+        if c is not None:
+            return c
+    if bm >= 64:
+        c = GEMM_CFG_64.get((N, K))
+        if c is not None:
+            return c
+    return GEMM_CFG.get((N, K))
+
+
+def _silu_cfg(I, K, bm):
+    if bm >= 128:
+        c = SILU_CFG_128.get((I, K))
+        if c is not None:
+            return c
+    if bm >= 64:
+        c = SILU_CFG_64.get((I, K))
+        if c is not None:
+            return c
+    return SILU_CFG.get((I, K))
+
 
 EVEN_K = os.environ.get("ENGINE_EVENK", "1") != "0"  # mask-free GEMV when the shape divides evenly
 ATTN_TARGET = int(os.environ.get("ENGINE_ATTN_TARGET", "256"))
@@ -707,7 +757,7 @@ TRIG = int(os.environ.get("ENGINE_TRIG", "1"))
 # silu/add-rmsnorm epilogues decompose). The kernels are already generic in BM (`mm = rm < M`
 # masks), so raising this is a tile-tuning problem, not a correctness one. Hidden workloads run
 # shapes the 3 public ones (all B<=16) never exercise. Tune GEMM_CFG/SILU_CFG per BM before use.
-BM_MAX = int(os.environ.get("ENGINE_BM_MAX", "32"))
+BM_MAX = int(os.environ.get("ENGINE_BM_MAX", "64"))
 
 
 def _bm(M):
@@ -858,7 +908,7 @@ class TritonOps:
     def linear(self, x, w):
         M, K = x.shape
         N = w.shape[0]
-        cfg = GEMM_CFG.get((N, K))
+        cfg = _gemm_cfg(N, K, _bm(M))
         if (not self.use_gemv or cfg is None or M > BM_MAX or not x.is_contiguous()
                 or not w.is_contiguous() or x.dtype != torch.bfloat16 or w.dtype != torch.bfloat16):
             return torch.nn.functional.linear(x, w)
@@ -886,7 +936,7 @@ class TritonOps:
         """silu(g) * u for [g; u] = x @ wgu^T"""
         M, K = x.shape
         I = wgu.shape[0] // 2
-        cfg = SILU_CFG.get((I, K))
+        cfg = _silu_cfg(I, K, _bm(M))
         if (not self.use_gemv or cfg is None or M > BM_MAX or not x.is_contiguous()
                 or not wgu.is_contiguous() or x.dtype != torch.bfloat16 or wgu.dtype != torch.bfloat16):
             return self.silu_mul(self.linear(x, wgu))
@@ -904,7 +954,7 @@ class TritonOps:
         """hn = h + x @ w^T ; returns (hn, rmsnorm(hn, lnw))"""
         M, K = x.shape
         N = w.shape[0]
-        cfg = GEMM_CFG.get((N, K))
+        cfg = _gemm_cfg(N, K, _bm(M))
         if (not self.use_gemv or cfg is None or cfg[2] == 1 or M > BM_MAX
                 or not x.is_contiguous() or not w.is_contiguous() or not h.is_contiguous()
                 or x.dtype != torch.bfloat16 or w.dtype != torch.bfloat16 or h.dtype != torch.bfloat16):
