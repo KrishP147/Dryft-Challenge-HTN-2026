@@ -735,28 +735,74 @@ GEMM_CFG_128 = {
 SILU_CFG_128 = {}
 
 
+# Speculative-decode verify rows (B*W) land on the same M>16 fused path at BM=32/64, but that
+# path's tuned BM=32/64 configs change BK/SK/num_warps (a K-reduction-order change) relative to
+# the BM=16 configs that all of tonight's correctness work validated. The spec path is new and
+# untested against that specific reduction order, so it forces BM=16's BN/BK/SK/NW values and
+# changes ONLY the tile height (BM, still _bm(M)) -- rows are then bit-identical to today's
+# non-spec BM=16 path, just more of them per launch. Set via engine.py's force_bm16_cfg().
+FORCE_BM16_CFG = False
+_SMEM_LIMIT = 232448  # H100 SM shared-memory budget for staged bf16 operand tiles
+
+
+def _safe_stages(bm, bn, bk, st, n_weight_tiles=1):
+    """Shrink num_stages (only) until the staged operand tiles fit shared memory at this BM.
+    Stage depth is software-pipelining scheduling, not part of the K-reduction/accumulation
+    order, so reducing it does not reintroduce the numerics risk force_bm16_cfg exists to avoid
+    -- BN/BK/SK stay exactly at their BM=16-tuned values."""
+    while st > 1 and st * (bm + n_weight_tiles * bn) * bk * 2 > _SMEM_LIMIT:
+        st -= 1
+    return st
+
+
 def _gemm_cfg(N, K, bm):
-    if bm >= 128:
-        c = GEMM_CFG_128.get((N, K))
-        if c is not None:
-            return c
-    if bm >= 64:
-        c = GEMM_CFG_64.get((N, K))
-        if c is not None:
-            return c
-    return GEMM_CFG.get((N, K))
+    if not FORCE_BM16_CFG:
+        if bm >= 128:
+            c = GEMM_CFG_128.get((N, K))
+            if c is not None:
+                return c
+        if bm >= 64:
+            c = GEMM_CFG_64.get((N, K))
+            if c is not None:
+                return c
+        return GEMM_CFG.get((N, K))
+    c = GEMM_CFG.get((N, K))
+    if c is None or bm <= 16:
+        return c
+    bn, bk, sk, st, nw = c
+    return (bn, bk, sk, _safe_stages(bm, bn, bk, st), nw)
 
 
 def _silu_cfg(I, K, bm):
-    if bm >= 128:
-        c = SILU_CFG_128.get((I, K))
-        if c is not None:
-            return c
-    if bm >= 64:
-        c = SILU_CFG_64.get((I, K))
-        if c is not None:
-            return c
-    return SILU_CFG.get((I, K))
+    if not FORCE_BM16_CFG:
+        if bm >= 128:
+            c = SILU_CFG_128.get((I, K))
+            if c is not None:
+                return c
+        if bm >= 64:
+            c = SILU_CFG_64.get((I, K))
+            if c is not None:
+                return c
+        return SILU_CFG.get((I, K))
+    c = SILU_CFG.get((I, K))
+    if c is None or bm <= 16:
+        return c
+    bn, bk, st, nw = c
+    return (bn, bk, _safe_stages(bm, bn, bk, st, n_weight_tiles=2), nw)
+
+
+import contextlib as _contextlib
+
+
+@_contextlib.contextmanager
+def force_bm16_cfg():
+    global FORCE_BM16_CFG
+    old = FORCE_BM16_CFG
+    FORCE_BM16_CFG = True
+    try:
+        yield
+    finally:
+        FORCE_BM16_CFG = old
 
 
 EVEN_K = os.environ.get("ENGINE_EVENK", "1") != "0"  # mask-free GEMV when the shape divides evenly

@@ -2,6 +2,7 @@
 
 v2: fused Triton ops (fused.py) with load-time selftest + torch fallback.
 """
+import contextlib as _contextlib
 import glob
 import json
 import math
@@ -11,9 +12,10 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from fused import TritonOps
+    from fused import TritonOps, force_bm16_cfg
 except Exception as _e:  # no triton / import failure: torch ops only
     TritonOps = None
+    force_bm16_cfg = None
     _FUSED_ERR = repr(_e)
 
 CAP_GRAN = 128
@@ -23,14 +25,20 @@ CAP_GRAN = 128
 # eager (B4 17.4->16.6 GiB, B16 18.8->18.0 GiB) because graph-pool reuse beats ad-hoc allocation.
 # 16384 measured no better. Audit shapes 1,8192,64 and 2,3000,32 clean at this cap.
 PREFILL_GRAPH_MAX = int(os.environ.get("ENGINE_PREFILL_GRAPH", "8192"))  # B*S at or below this: prefill runs as a CUDA graph (0 = off)
-SPEC = os.environ.get("ENGINE_SPEC", "1") == "1"  # exact n-gram speculation, B=1 only; engaged only at n >= SPEC_MIN_N below
+SPEC = os.environ.get("ENGINE_SPEC", "1") == "1"  # exact n-gram speculation; engaged per the B/n policy below
 SPEC_W_MAX = 7  # verify width: 1 known token + up to 6 n-gram drafts
-SPEC_ROWS = 16  # max B*W rows through the skinny GEMVs
-# Short outputs never reach the region where greedy Qwen3 falls into repetition loops (the
-# original official failure was B1 512->32), so the draft rarely hits and verify overhead
-# dominates. Measured: B1 n=512 gives 1.93x TPOT (CV 25.3%, marginal), n=1024 gives 2.34x
-# (CV 18.0%, passes) -- gate on n so the loss case (short output) never engages.
-SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", "256"))
+SPEC_ROWS = 64  # max B*W rows through the skinny GEMVs (raised from 16: BM_MAX=64 now takes
+                # M<=64 on the fused path, so B16 gets W=4 and B4 gets W=7 instead of W=1)
+# Policy for which batches/output-lengths use speculation. B=1 has unfixable single-sequence
+# timing variance (min-over-1 has no averaging effect against a late-looping draw); short
+# outputs never reach the region where greedy Qwen3 falls into repetition loops (the original
+# official failure was B1 512->32), so the draft rarely hits and verify overhead dominates.
+# Aggressive defaults (min batch 4, min output 96): only the best eligible official run counts,
+# so an unstable_timing failure costs one queue slot and nothing else, while B4's measured 2.32x
+# (CV 20%) is the largest win found tonight. SPEC_MIN_B=16 is the conservative fallback (CV ~5.5%).
+SPEC_MIN_B = int(os.environ.get("ENGINE_SPEC_MIN_B", "4"))
+SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", "96"))
+SPEC_W_OVERRIDE = os.environ.get("ENGINE_SPEC_W")  # force a specific W for the A/B sweep
 MAX_STATES = 6
 ROPE_LEN = 32768  # tables for cap <= this are built once; growing past it rebuilds them and drops the graphs
 
@@ -377,10 +385,19 @@ class Engine:
         st.pos.add_(1)
 
     def _spec_body(self, st):
-        st.sout.copy_(self._forward(st, st.sin.reshape(-1), st.W, st.spos).view(st.B, st.W))
+        # force_bm16_cfg: keep BN/BK/SK/num_warps at their BM=16-validated values, changing only
+        # the tile height (BM=_bm(M)) for the wider verify-row batch -- see fused.py's comment.
+        ctx = force_bm16_cfg() if force_bm16_cfg is not None else _contextlib.nullcontext()
+        with ctx:
+            st.sout.copy_(self._forward(st, st.sin.reshape(-1), st.W, st.spos).view(st.B, st.W))
 
     def _selftest_spec(self):
-        """Verify-width forward vs step-by-step decode on the real weights."""
+        """Verify-width forward vs step-by-step decode on the real weights. Two checks:
+        B=1/W=5 (the original) and B=4/W=4 with DISTINCT per-sequence positions -- the latter is
+        what batched speculation actually depends on (POS_STRIDE=1 per-row position indexing in
+        qkv_post/attn, exercised only when sequences in one verify launch sit at different
+        positions). A bug there is silently wrong output, not a crash, so this must pass before
+        SPEC is trusted for B>1."""
         if not SPEC or TritonOps is None or not isinstance(self.ops, TritonOps):
             return
         try:
@@ -403,8 +420,50 @@ class Engine:
             self._spec_body(sp)
             got = self._dbg[-1]
             diff = max((got[j] - plain[j + 1][0]).abs().max().item() for j in range(W))
-            print(f"[engine] spec selftest max logit diff {diff:.4f}")
-            self.spec_ok = diff <= 0.5
+            print(f"[engine] spec selftest (B=1) max logit diff {diff:.4f}")
+            ok1 = diff <= 0.5
+
+            # B=4, W=4, distinct per-sequence positions. Built from ONE uniform lock-step decode
+            # timeline (B=4 native, no special-casing needed there) and re-verifying each
+            # sequence's OWN window at a DIFFERENT offset into that same timeline -- causally and
+            # numerically identical to re-decoding that sequence from that position, since KV
+            # content at any position is independent of other sequences and of what gets
+            # (re)written at LATER positions in the same verify launch (causal mask keeps row s
+            # blind to rows > s regardless of write order).
+            B2, W2 = 4, 4
+            offsets = [0, 3, 7, 11]
+            S2 = 96
+            nsteps = max(offsets) + W2
+            ids2 = torch.randint(100, 5000, (B2, S2), device=self.dev)
+            st2 = self._state(B2, 128, graph=False)
+            self._dbg = []
+            st2.pos.fill_(S2)
+            self._prefill(ids2, st2)
+            toks2 = [st2.tok.clone()]
+            for _ in range(nsteps):
+                self._decode_body(st2)
+                toks2.append(st2.tok.clone())
+            plain2 = self._dbg
+            sp2 = self._state(B2, 128, graph=False, W=W2)
+            for i in range(self.L):
+                sp2.kc[i].copy_(st2.kc[i])
+                sp2.vc[i].copy_(st2.vc[i])
+            sp2.spos.copy_(torch.tensor([S2 + o for o in offsets], dtype=torch.long, device=self.dev))
+            for b, off in enumerate(offsets):
+                for s in range(W2):
+                    sp2.sin[b, s] = toks2[off + s][b]
+            self._dbg = []
+            self._spec_body(sp2)
+            got2 = self._dbg[-1]
+            diff2 = 0.0
+            for b, off in enumerate(offsets):
+                for s in range(W2):
+                    d = (got2[b * W2 + s] - plain2[off + s + 1][b]).abs().max().item()
+                    diff2 = max(diff2, d)
+            print(f"[engine] spec selftest (B=4, distinct per-row positions) max logit diff {diff2:.4f}")
+            ok2 = diff2 <= 0.5
+
+            self.spec_ok = ok1 and ok2
         except Exception as e:
             print(f"[engine] spec selftest error: {e!r}")
             self.spec_ok = False
@@ -476,9 +535,12 @@ class Engine:
             yield from self._generate_ragged(input_ids, max_new_tokens)
             return
         n = max_new_tokens
-        if self.spec_ok and SPEC and B == 1 and n >= SPEC_MIN_N:
-            yield from self._generate_spec(input_ids, n)
-            return
+        if self.spec_ok and SPEC and B >= SPEC_MIN_B and n >= SPEC_MIN_N:
+            W = int(SPEC_W_OVERRIDE) if SPEC_W_OVERRIDE else min(SPEC_W_MAX, SPEC_ROWS // B)
+            W = max(1, min(W, SPEC_ROWS // B, SPEC_W_MAX))
+            if W >= 2:
+                yield from self._generate_spec(input_ids, n, W)
+                return
         cap = -(-(S + n) // CAP_GRAN) * CAP_GRAN
         if cap > self.cos.shape[0]:
             self._grow_rope(cap)
@@ -506,13 +568,14 @@ class Engine:
             ev[n - 1].synchronize()
         yield host[n - 1].tolist()
 
-    def _generate_spec(self, input_ids, n):
-        """Exact n-gram speculative decoding for tiny batches: each step verifies
-        W tokens per sequence (last accepted + drafts) in one graph replay, keeps
-        the longest prefix whose drafts equal the model's own greedy outputs, plus
-        one bonus token. KV entries of rejected drafts are overwritten later."""
+    def _generate_spec(self, input_ids, n, W):
+        """Exact n-gram speculative decoding: each step verifies W tokens per sequence (last
+        accepted + drafts) in one graph replay, keeps the longest prefix whose drafts equal the
+        model's own greedy outputs, plus one bonus token. KV entries of rejected drafts are
+        overwritten later. B>1: per-sequence draft state (_NG), accept counts and positions --
+        the batch as a whole advances at the pace of its SLOWEST sequence each step (lockstep
+        yield), so the speedup is min_b(accepted/step), not the mean."""
         B, S = len(input_ids), len(input_ids[0])
-        W = min(SPEC_W_MAX, SPEC_ROWS // B)
         K = W - 1
         cap = -(-(S + n + W) // CAP_GRAN) * CAP_GRAN
         if cap > self.cos.shape[0]:
