@@ -26,36 +26,42 @@ CAP_GRAN = 128
 # eager (B4 17.4->16.6 GiB, B16 18.8->18.0 GiB) because graph-pool reuse beats ad-hoc allocation.
 # 16384 measured no better. Audit shapes 1,8192,64 and 2,3000,32 clean at this cap.
 PREFILL_GRAPH_MAX = int(os.environ.get("ENGINE_PREFILL_GRAPH", "8192"))  # B*S at or below this: prefill runs as a CUDA graph (0 = off)
-SPEC = os.environ.get("ENGINE_SPEC", "1") == "1"  # exact n-gram speculation; engaged per the B/n policy below
-SPEC_W_MAX = int(os.environ.get("ENGINE_SPEC_W_MAX", "2"))  # verify width: 1 known + 1 n-gram
-                # draft. W=2 is the risk-adjusted optimum, measured as an explicit floor-vs-upside
-                # A/B (pod, 5 samples). The FLOOR is what a build pays when the draft never hits --
-                # forced by poisoning the drafter with random ids -- and it is what every previous
-                # official spec run mostly collected, because platform acceptance is low:
-                #   W:        2       3       4       7
-                #   floor:   -2.0%   -3.2%   -3.8%   -8.0%   (geomean B4-2048-32/128, B8-1024-64)
-                #   n=32:    +5.2%   +5.4%   +5.7%   +4.5%   (B4 2048, pydoc, where drafts do hit)
-                #   n=128:  +13.0%  +13.7%  +15.0%  +11.8%
-                # W=2 gives up almost nothing at the short outputs the hidden set actually has, and
-                # costs a quarter of W=7 when the draft misses. The W=7 builds scored 1030 (n>=64)
-                # and 1000 (all n) against a 1046 baseline -- consistent with platform acceptance
-                # worth ~+6%, i.e. enough to clear a -2% floor but not an -8% one.
-SPEC_ROWS = 64  # max B*W rows through the skinny GEMVs (raised from 16: BM_MAX=64 now takes
-                # M<=64 on the fused path, so B16 gets W=4 and B4 gets W=7 instead of W=1)
-# Policy for which batches/output-lengths use speculation. B=1 has unfixable single-sequence
-# timing variance (min-over-1 has no averaging effect against a late-looping draw); short
-# outputs never reach the region where greedy Qwen3 falls into repetition loops (the original
-# official failure was B1 512->32), so the draft rarely hits and verify overhead dominates.
-# Aggressive defaults (min batch 4, min output 96): only the best eligible official run counts,
-# so an unstable_timing failure costs one queue slot and nothing else, while B4's measured 2.32x
-# (CV 20%) is the largest win found tonight. SPEC_MIN_B=16 is the conservative fallback (CV ~5.5%).
-SPEC_MIN_B = int(os.environ.get("ENGINE_SPEC_MIN_B", "2"))  # B2 floor is only -0.9% at W=2
-SPEC_MAX_B = int(os.environ.get("ENGINE_SPEC_MAX_B", "8"))  # B16 spec is dead, and stays dead at
-                # W=2: floor -5.5% (512->128) / -2.9% (2048->128) against a pydoc upside of only
-                # +4.4% / +4.7%. It is the one batch where the floor exceeds the best case.
-SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", "1"))  # no length gate. The length gates
-                # (512, then 64) existed to dodge W=7's -8% floor on short outputs; at W=2 the floor
-                # is -2% and n=32 already measures +5.2%, so there is nothing left to dodge.
+SPEC = os.environ.get("ENGINE_SPEC", "1") == "1"  # exact speculation; engaged per the B/n policy below
+SPEC_ROWS = 64  # max B*W rows through the skinny GEMVs
+SPEC_MODE = os.environ.get("ENGINE_SPEC_MODE", "gpu")  # "gpu" (default): drafting + verification +
+                # acceptance run entirely inside the CUDA graph (_generate_gspec, dense per-sequence
+                # bigram/token-recycling table drafter), host only harvests results one step behind,
+                # pipelined exactly like the plain decode path -- no per-step host round trip.
+                # "host": CPU n-gram drafter with a synchronous per-step round trip
+                # (_generate_spec). The two algorithms were tuned independently (different
+                # floor/upside tradeoffs), so the B/n/W gate defaults below switch with the mode;
+                # ENGINE_SPEC_* env vars still override either one explicitly.
+if SPEC_MODE == "gpu":
+    # Tuned on natural-prose pod measurements (tests/bench.py --corpus prose) for the in-graph
+    # token-recycling drafter: B4 2048->{64,128} +4.4%/+11.2% CV 2-7%, B2 3000->96 +7.0% CV 8%.
+    # B=1 shows the BIGGEST win (+20-29% at n>=64) but an unfixable single-sequence timing spread
+    # that hits 22-27% at n=128 -- over the platform's 25% CV limit -- so it stays out of the
+    # gate pending a per-batch-width fix. n=32 excluded too (B4 2048->32 measured -0.3%, noise,
+    # not a win). MIN_B=2/MAX_B=4/MIN_N=64 => all three public shapes (B1 512->*, B4 2048->32,
+    # B16 512->128) are OUTSIDE this gate and run bit-identical to plain decode.
+    _MIN_B_DEF, _MAX_B_DEF, _MIN_N_DEF, _W_MAX_DEF = "2", "4", "64", "4"
+else:
+    # Tuned for the host n-gram drafter as an explicit floor-vs-upside A/B (pod, 5 samples). The
+    # FLOOR is what a build pays when the draft never hits (poisoned with random ids) -- what most
+    # official spec runs mostly collected, since platform acceptance is low:
+    #   W:        2       3       4       7
+    #   floor:   -2.0%   -3.2%   -3.8%   -8.0%   (geomean B4-2048-32/128, B8-1024-64)
+    #   n=32:    +5.2%   +5.4%   +5.7%   +4.5%   (B4 2048, pydoc, where drafts do hit)
+    #   n=128:  +13.0%  +13.7%  +15.0%  +11.8%
+    # W=2 gives up almost nothing at short outputs and costs a quarter of W=7 when the draft
+    # misses. B16 stays excluded: floor -5.5%/-2.9% against a pydoc upside of only +4.4%/+4.7% --
+    # the one batch where the floor exceeds the best case. No length gate: at W=2 the floor is
+    # only -2% and n=32 already measures +5.2%, so there is nothing left to dodge.
+    _MIN_B_DEF, _MAX_B_DEF, _MIN_N_DEF, _W_MAX_DEF = "2", "8", "1", "2"
+SPEC_MIN_B = int(os.environ.get("ENGINE_SPEC_MIN_B", _MIN_B_DEF))
+SPEC_MAX_B = int(os.environ.get("ENGINE_SPEC_MAX_B", _MAX_B_DEF))
+SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", _MIN_N_DEF))
+SPEC_W_MAX = int(os.environ.get("ENGINE_SPEC_W_MAX", _W_MAX_DEF))
 SPEC_W_OVERRIDE = os.environ.get("ENGINE_SPEC_W")  # force a specific W for the A/B sweep
 MAX_STATES = 6
 ROPE_LEN = 32768  # tables for cap <= this are built once; growing past it rebuilds them and drops the graphs
@@ -224,12 +230,15 @@ class Engine:
         self.ops = _TorchOps(self)
         self.pool = torch.cuda.graph_pool_handle() if self.dev.type == "cuda" else None
         self.spec_ok = False
+        self.gspec_ok = False
         # fp8 prefill is disabled during the 0.5-tolerance selftests (fp8's ~0.5-logit drift would
         # trip the bf16 fallback); enabled for real generation, validated separately at the 2.0 gate.
         self.fp8_prefill = False
         if self.dev.type == "cuda":
             self._selftest()
             self._selftest_spec()
+            if SPEC_MODE == "gpu":
+                self._selftest_gspec()
             self.fp8_prefill = FP8 and isinstance(self.ops, TritonOps) and hasattr(self.layers[0], "wqkv8")
 
     def _fp8_lin(self, x, w8, ws, wbf):
@@ -601,7 +610,10 @@ class Engine:
             W = int(SPEC_W_OVERRIDE) if SPEC_W_OVERRIDE else min(SPEC_W_MAX, SPEC_ROWS // B)
             W = max(1, min(W, SPEC_ROWS // B, SPEC_W_MAX))
             if W >= 2:
-                yield from self._generate_spec(input_ids, n, W)
+                if SPEC_MODE == "gpu" and self.gspec_ok:
+                    yield from self._generate_gspec(input_ids, n, W)
+                else:
+                    yield from self._generate_spec(input_ids, n, W)
                 return
         cap = -(-(S + n) // CAP_GRAN) * CAP_GRAN
         if cap > self.cos.shape[0]:
@@ -688,6 +700,211 @@ class Engine:
             while yielded < m:
                 yield [out[b][yielded] for b in range(B)]
                 yielded += 1
+
+    # ----------------------------------------------------------- GPU-graph spec
+    # Drafting, verification and acceptance all run ON DEVICE inside the captured graph,
+    # so the host never blocks on a per-step round trip -- replay(t+1) is launched before
+    # the host reads step t's result, exactly like the plain decode path.
+    #
+    # Drafter: a dense per-sequence "token recycling" table T (B, vocab) long, T[b, v] =
+    # the model's own last argmax prediction for whenever token v was fed as input to
+    # sequence b (agent C's sim: beats n-gram prompt-lookup on natural prose, and needs
+    # ~5 device ops/step instead of ~20-25 for an in-graph n-gram search over `hist`).
+    # d1 = T[last], d2 = T[d1], ... chains K=W-1 gathers. Seeded from the prompt's own
+    # bigrams (T[prompt[i]] = prompt[i+1]) and refreshed every step from the verify
+    # forward's real output (T[row] = out), so it tracks the model's actual behavior on
+    # THIS sequence, not just literal repeats. Exactness is unaffected by what the
+    # drafter guesses (see _generate_spec's docstring / this file's history): any
+    # accepted token is validated by the verify forward's own induction regardless of
+    # how it was drafted, so a table miss is merely wasted work, never wrong output.
+    #   tok (B,) long: last confirmed token; NO KV yet (same invariant as plain `tok`).
+    #   gpos (B,) long: tok's absolute position.
+    #   limit (1,) long: S + n - 1 (max valid position), refilled per call.
+    def _gstate(self, B, cap, W):
+        key = ("g", B, cap, W)
+        st = self.states.get(key)
+        if st is not None:
+            return st
+        if len(self.states) >= MAX_STATES:
+            del self.states[next(iter(self.states))]
+            if self.dev.type == "cuda":
+                torch.cuda.empty_cache()
+        st = _State()
+        st.B, st.cap, st.W = B, cap, W
+        st.gpu = True
+        shape = (B, self.nkv, cap, self.hd)
+        st.kc = [torch.zeros(shape, dtype=self.dtype, device=self.dev) for _ in range(self.L)]
+        st.vc = [torch.zeros(shape, dtype=self.dtype, device=self.dev) for _ in range(self.L)]
+        st.tok = torch.zeros(B, dtype=torch.long, device=self.dev)
+        st.gpos = torch.zeros(B, dtype=torch.long, device=self.dev)
+        st.limit = torch.zeros(1, dtype=torch.long, device=self.dev)
+        st.T = torch.zeros(B, self.embed.shape[0], dtype=torch.long, device=self.dev)
+        st.sin = torch.zeros(B, W, dtype=torch.long, device=self.dev)
+        st.spos = torch.zeros(B, dtype=torch.long, device=self.dev)
+        st.sout = torch.zeros(B, W, dtype=torch.long, device=self.dev)
+        st.gacc = torch.zeros(B, dtype=torch.long, device=self.dev)
+        st.pos = torch.zeros(1, dtype=torch.long, device=self.dev)  # unused; kept so any
+                # shared helper that touches st.pos (none currently) does not crash
+        st.tried_graph = True
+        st.graph = None
+        st.pgraphs = {}
+        st.hcap = 0
+        self.states[key] = st
+        if self.dev.type == "cuda":
+            try:
+                self._capture_gspec(st)
+            except Exception as e:  # fall back to eager
+                print(f"[engine] gspec graph capture failed for {key}: {e!r}")
+                st.graph = None
+        return st
+
+    def _capture_gspec(self, st):
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self._gspec_body(st)
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, pool=self.pool):
+            self._gspec_body(st)
+        st.graph = g
+        torch.cuda.synchronize()
+
+    def _gspec_body(self, st):
+        """One in-graph step: chain K=W-1 table lookups for the draft, verify all W rows
+        in one forward, accept the longest correct prefix + 1 bonus token, recycle every
+        row's (input, model-output) pair into the table, advance tok/gpos."""
+        B, W = st.B, st.W
+        K = W - 1
+        tok, T, limit = st.tok, st.T, st.limit
+        drafts = []
+        cur = tok
+        for _ in range(K):
+            cur = T.gather(1, cur.unsqueeze(1)).squeeze(1)
+            drafts.append(cur)
+        rows = torch.stack([tok] + drafts, dim=1) if K else tok.unsqueeze(1)  # (B, W)
+        st.sin.copy_(rows)
+        st.spos.copy_(st.gpos)
+        ctx = force_bm16_cfg() if force_bm16_cfg is not None else _contextlib.nullcontext()
+        with ctx:
+            st.sout.copy_(self._forward(st, st.sin.reshape(-1), W, st.spos).view(B, W))
+        if K:
+            d = torch.stack(drafts, dim=1)  # (B, K)
+            match = (d == st.sout[:, :K]).long()
+            acc = torch.cumprod(match, 1).sum(1)
+        else:
+            acc = torch.zeros(B, dtype=torch.long, device=tok.device)
+        T.scatter_(1, rows, st.sout)  # token recycling: T[input] = model's own next-token
+        st.gacc.copy_(acc)
+        st.tok.copy_(st.sout.gather(1, acc.unsqueeze(1)).squeeze(1))
+        st.gpos.copy_(torch.minimum(st.gpos + acc + 1, limit))
+
+    def _generate_gspec(self, input_ids, n, W):
+        """Host side: launch replay(t+1) before consuming replay(t)'s result (pipelined,
+        like the plain decode path), reconstruct each sequence's stream from the device-
+        computed (out, acc) pair, yield lockstep at the min length over sequences."""
+        B, S = len(input_ids), len(input_ids[0])
+        cap = -(-(S + n + 2 * W) // CAP_GRAN) * CAP_GRAN
+        if cap > self.cos.shape[0]:
+            self._grow_rope(cap)
+        st = self._gstate(B, cap, W)
+        st.limit.fill_(S + n - 1)
+        ids = torch.tensor(input_ids, dtype=torch.long, device=self.dev)
+        self._prefill(ids, st)  # writes st.tok = first generated token via st.kc/st.vc
+        st.T.zero_()
+        if S >= 2:
+            st.T.scatter_(1, ids[:, :-1], ids[:, 1:])
+        st.T.scatter_(1, ids[:, -1:], st.tok.unsqueeze(1))
+        st.gpos.fill_(S)
+        first = st.tok.tolist()
+        out = [[t] for t in first]
+        yielded = 1
+        yield list(first)
+        if yielded >= n:
+            return
+        cuda = self.dev.type == "cuda"
+        max_steps = n  # worst case: 1 confirmed token per step (acc=0 every step)
+        gout = torch.zeros((max_steps, B, W), dtype=torch.long, pin_memory=cuda)
+        gacc = torch.zeros((max_steps, B), dtype=torch.long, pin_memory=cuda)
+        gev = [torch.cuda.Event() for _ in range(max_steps)] if cuda else [None] * max_steps
+
+        def launch(t):
+            if st.graph is not None:
+                st.graph.replay()
+            else:
+                self._gspec_body(st)
+            gout[t].copy_(st.sout, non_blocking=cuda)
+            gacc[t].copy_(st.gacc, non_blocking=cuda)
+            if cuda:
+                gev[t].record()
+
+        launch(0)
+        t = 0
+        while True:
+            finished = all(len(x) >= n for x in out)
+            advanced = not finished and t + 1 < max_steps
+            if advanced:
+                launch(t + 1)
+            if cuda:
+                gev[t].synchronize()
+            o, a = gout[t].tolist(), gacc[t].tolist()
+            for b in range(B):
+                if len(out[b]) >= n:
+                    continue
+                take = min(a[b] + 1, n - len(out[b]))
+                out[b] += o[b][:take]
+            m = min(len(x) for x in out)
+            while yielded < m:
+                yield [out[b][yielded] for b in range(B)]
+                yielded += 1
+            if yielded >= n or not advanced:
+                break
+            t += 1
+
+    def _selftest_gspec(self):
+        """Token-exact check against real autoregressive plain decode (not just a logit-gap
+        tolerance): the challenge requires bit-identical greedy output, so this must pass
+        before ENGINE_SPEC_MODE=gpu is trusted."""
+        if not SPEC or TritonOps is None or not isinstance(self.ops, TritonOps):
+            return
+        try:
+            torch.manual_seed(3)
+            for (B, S, n, W) in [(1, 80, 24, 4), (3, 96, 30, 3), (4, 64, 20, 5)]:
+                ids = torch.randint(100, 5000, (B, S), device=self.dev)
+                input_ids = ids.tolist()
+                cap = -(-(S + n) // CAP_GRAN) * CAP_GRAN
+                stp = self._state(B, cap, graph=False)
+                stp.pos.fill_(S)
+                self._prefill(ids, stp)
+                truth = [stp.tok.tolist()]
+                for _ in range(n - 1):
+                    self._decode_body(stp)
+                    truth.append(stp.tok.tolist())
+                self.states.clear()
+                # fresh mempool: repeated capture/free of graphs sharing self.pool across
+                # these iterations otherwise trips a CUDACachingAllocator assert (same
+                # hazard _grow_rope guards against).
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                self.pool = torch.cuda.graph_pool_handle()
+                got = list(self._generate_gspec(input_ids, n, W))
+                self.states.clear()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                self.pool = torch.cuda.graph_pool_handle()
+                ok = got == truth
+                print(f"[engine] gspec selftest B={B} S={S} n={n} W={W} match={ok}")
+                if not ok:
+                    self.gspec_ok = False
+                    return
+            self.gspec_ok = True
+        except Exception as e:
+            print(f"[engine] gspec selftest error: {e!r}")
+            self.gspec_ok = False
+        finally:
+            self.states.clear()
 
     def _generate_ragged(self, input_ids, n):
         groups = {}

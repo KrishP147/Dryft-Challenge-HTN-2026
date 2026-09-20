@@ -54,7 +54,11 @@ def prompts(B, S, seed):
     if _CORPUS is None:
         from transformers import AutoTokenizer
 
-        if args.corpus == "code":
+        if args.corpus == "prose":
+            import glob
+
+            text = chr(10).join(open(f, errors="ignore").read() for f in sorted(glob.glob("/workspace/prose*.txt")))
+        elif args.corpus == "code":
             import glob
 
             text = chr(10).join(open(f, errors="ignore").read() for f in sorted(glob.glob("/usr/lib/python3*/**/*.py", recursive=True))[:300])
