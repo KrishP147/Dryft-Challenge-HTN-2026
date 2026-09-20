@@ -61,6 +61,9 @@ else:
 SPEC_MIN_B = int(os.environ.get("ENGINE_SPEC_MIN_B", _MIN_B_DEF))
 SPEC_MAX_B = int(os.environ.get("ENGINE_SPEC_MAX_B", _MAX_B_DEF))
 SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", _MIN_N_DEF))
+# B>=2 gate reaches down to n=32: margin acceptance lifted short-output acceptance, and public-1
+# (B4 2048->32) then reports spec tpot directly. B1 stays at SPEC_MIN_N (single-sequence CV risk).
+SPEC_MIN_N_MULTI = int(os.environ.get("ENGINE_SPEC_MIN_N_MULTI", "32" if SPEC_MODE == "gpu" else _MIN_N_DEF))
 SPEC_W_MAX = int(os.environ.get("ENGINE_SPEC_W_MAX", _W_MAX_DEF))
 SPEC_W_OVERRIDE = os.environ.get("ENGINE_SPEC_W")  # force a single fixed W (host mode: skip dynamic width choice)
 # --- host-mode dynamic multi-width spec knobs (see _generate_spec) ---
@@ -89,12 +92,6 @@ SPEC_T2 = os.environ.get("ENGINE_SPEC_T2", "0") == "1"  # set ENGINE_SPEC_T2=1 t
 # within SPEC_MARGIN of the row's max logit (the judge accepts any token within 2.0 logits of
 # native argmax), instead of only when it IS the argmax. 0 = exact greedy speculation.
 SPEC_MARGIN = float(os.environ.get("ENGINE_SPEC_MARGIN", "1.0"))
-# Identity-init the 1-token draft table: an unseen token drafts ITSELF ("repeat last token")
-# instead of token 0 (an always-miss). Greedy Qwen degenerates into repetition on long outputs
-# (where all of the acceptance lives), so "repeat" is the single best zero-knowledge draft. Exact:
-# the drafter only proposes; verify+accept still decides every emitted token. Floor-unchanged
-# (a wrong draft is simply rejected, W is fixed). Seen entries are overwritten by token recycling.
-SPEC_SEED_ID = os.environ.get("ENGINE_SPEC_SEED_ID", "1") == "1"
 SPEC_T2_SLOTS = int(os.environ.get("ENGINE_SPEC_T2_SLOTS", str(1 << 20)))  # power of 2 not required (uses %)
 
 MAX_STATES = 6
@@ -695,7 +692,7 @@ class Engine:
             yield from self._generate_ragged(input_ids, max_new_tokens)
             return
         n = max_new_tokens
-        if self.spec_ok and SPEC and SPEC_MIN_B <= B <= SPEC_MAX_B and n >= SPEC_MIN_N:
+        if self.spec_ok and SPEC and SPEC_MIN_B <= B <= SPEC_MAX_B and n >= (SPEC_MIN_N if B == 1 else SPEC_MIN_N_MULTI):
             W = int(SPEC_W_OVERRIDE) if SPEC_W_OVERRIDE else min(SPEC_W_MAX, SPEC_ROWS // B)
             W = max(1, min(W, SPEC_ROWS // B, SPEC_W_MAX))
             if SPEC_MODE == "gpu" and B > 4 and not SPEC_W_OVERRIDE:
@@ -993,12 +990,7 @@ class Engine:
         st.limit.fill_(S + n - 1)
         ids = torch.tensor(input_ids, dtype=torch.long, device=self.dev)
         self._prefill(ids, st)  # writes st.tok = first generated token via st.kc/st.vc
-        if SPEC_SEED_ID:
-            if getattr(self, "_ident_row", None) is None or self._ident_row.shape[1] != st.T.shape[1]:
-                self._ident_row = torch.arange(st.T.shape[1], device=self.dev).unsqueeze(0)
-            st.T.copy_(self._ident_row)  # (1,V) broadcast to (B,V): unseen token drafts itself
-        else:
-            st.T.zero_()
+        st.T.zero_()
         if S >= 2:
             st.T.scatter_(1, ids[:, :-1], ids[:, 1:])
         st.T.scatter_(1, ids[:, -1:], st.tok.unsqueeze(1))
