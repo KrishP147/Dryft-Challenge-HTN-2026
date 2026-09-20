@@ -84,7 +84,7 @@ SPEC_POISON = os.environ.get("ENGINE_SPEC_POISON") == "1"
 # handled identically to an empty slot -- always falls back to T[v], so this can never change
 # emitted tokens (verify+acceptance is the only thing that decides output; a table is only ever a
 # guess). UNVALIDATED on pod (no GPU available this sprint) -- default OFF.
-SPEC_T2 = os.environ.get("ENGINE_SPEC_T2", "0") == "1"  # set ENGINE_SPEC_T2=1 to engage; see _gspec_body.
+SPEC_T2 = os.environ.get("ENGINE_SPEC_T2", "1") == "1"  # set ENGINE_SPEC_T2=1 to engage; see _gspec_body.
 SPEC_T2_SLOTS = int(os.environ.get("ENGINE_SPEC_T2_SLOTS", str(1 << 20)))  # power of 2 not required (uses %)
 
 MAX_STATES = 6
@@ -863,8 +863,9 @@ class Engine:
         st.T = torch.zeros(B, self.embed.shape[0], dtype=torch.long, device=self.dev)
         st.prevtok = torch.zeros(B, dtype=torch.long, device=self.dev)
         if SPEC_T2:
-            st.T2key = torch.full((B, SPEC_T2_SLOTS), -1, dtype=torch.long, device=self.dev)
-            st.T2val = torch.zeros(B, SPEC_T2_SLOTS, dtype=torch.long, device=self.dev)
+            # one packed int64 per slot: (key << 18) | value (vocab < 2**18), so key and value
+            # always come from the SAME writer under duplicate-index scatter; -1 = empty
+            st.T2 = torch.full((B, SPEC_T2_SLOTS), -1, dtype=torch.long, device=self.dev)
         st.sin = torch.zeros(B, W, dtype=torch.long, device=self.dev)
         st.spos = torch.zeros(B, dtype=torch.long, device=self.dev)
         st.sout = torch.zeros(B, W, dtype=torch.long, device=self.dev)
@@ -913,11 +914,10 @@ class Engine:
         if SPEC_T2:
             u, v = st.prevtok, tok
             for _ in range(K):
-                slot = (u * V + v) % SPEC_T2_SLOTS
-                hit = st.T2key.gather(1, slot.unsqueeze(1)).squeeze(1)
-                t2v = st.T2val.gather(1, slot.unsqueeze(1)).squeeze(1)
+                key = u * V + v
+                pk = st.T2.gather(1, (key % SPEC_T2_SLOTS).unsqueeze(1)).squeeze(1)
                 fallback = T.gather(1, v.unsqueeze(1)).squeeze(1)
-                cur = torch.where(hit == u * V + v, t2v, fallback)
+                cur = torch.where((pk >> 18) == key, pk & 0x3FFFF, fallback)
                 drafts.append(cur)
                 u, v = v, cur
         else:
@@ -942,8 +942,7 @@ class Engine:
             ctxu = torch.cat([st.prevtok.unsqueeze(1), rows[:, :-1]], dim=1) if K else st.prevtok.unsqueeze(1)
             key2 = ctxu * V + rows
             slot2 = key2 % SPEC_T2_SLOTS
-            st.T2key.scatter_(1, slot2, key2)  # store the key alongside the value: a probe whose
-            st.T2val.scatter_(1, slot2, st.sout)  # stored key doesn't match is a miss, not a wrong hit
+            st.T2.scatter_(1, slot2, (key2 << 18) | st.sout)  # stored key mismatch on probe = miss
             st.prevtok.copy_(rows.gather(1, acc.unsqueeze(1)).squeeze(1))
         st.gacc.copy_(acc)
         st.tok.copy_(st.sout.gather(1, acc.unsqueeze(1)).squeeze(1))
@@ -967,19 +966,17 @@ class Engine:
         st.T.scatter_(1, ids[:, -1:], st.tok.unsqueeze(1))
         st.prevtok.copy_(ids[:, -1])  # token before the first generated token, for T2's context
         if SPEC_T2:
-            st.T2key.fill_(-1)  # states are cached and reused across calls with different prompts
+            st.T2.fill_(-1)  # states are cached and reused across calls with different prompts
             V = self.embed.shape[0]
             if S >= 3:
                 u, v, nxt = ids[:, :-2], ids[:, 1:-1], ids[:, 2:]  # seed from prompt trigrams
                 key = u * V + v
                 slot = key % SPEC_T2_SLOTS
-                st.T2key.scatter_(1, slot, key)
-                st.T2val.scatter_(1, slot, nxt)
+                st.T2.scatter_(1, slot, (key << 18) | nxt)
             if S >= 2:  # (2nd-to-last, last) prompt token -> first generated token
                 key1 = (ids[:, -2] * V + ids[:, -1]).unsqueeze(1)
                 slot1 = key1 % SPEC_T2_SLOTS
-                st.T2key.scatter_(1, slot1, key1)
-                st.T2val.scatter_(1, slot1, st.tok.unsqueeze(1))
+                st.T2.scatter_(1, slot1, (key1 << 18) | st.tok.unsqueeze(1))
         st.gpos.fill_(S)
         first = st.tok.tolist()
         out = [[t] for t in first]
