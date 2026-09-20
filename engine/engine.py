@@ -76,6 +76,17 @@ SPEC_COOLDOWN = int(os.environ.get("ENGINE_SPEC_COOLDOWN", "8"))  # steps to sto
 # gates that lost officially; the floor is the half of the trade that is corpus-independent.
 SPEC_POISON = os.environ.get("ENGINE_SPEC_POISON") == "1"
 
+# --- gpu-mode drafter quality: 2-token-context table (see _gspec_body) ---
+# Agent D's offline sim (SPRINT.md / tests/drafter_sim.py, 6000 natural-text windows): first-draft
+# precision in the first 32 generated tokens: T[v] (1-token context) 18.3%, T2[(u,v)] with T[v]
+# fallback 19.7%; tok/step at K=4 over buckets 0-32/32-64/64-128: 1.29(ngram)/1.40(T)/1.61(T2).
+# Fixed-size device hash table keyed by (u*V+v); collision (stored key != probe key) is a miss,
+# handled identically to an empty slot -- always falls back to T[v], so this can never change
+# emitted tokens (verify+acceptance is the only thing that decides output; a table is only ever a
+# guess). UNVALIDATED on pod (no GPU available this sprint) -- default OFF.
+SPEC_T2 = os.environ.get("ENGINE_SPEC_T2", "0") == "1"  # set ENGINE_SPEC_T2=1 to engage; see _gspec_body.
+SPEC_T2_SLOTS = int(os.environ.get("ENGINE_SPEC_T2_SLOTS", str(1 << 20)))  # power of 2 not required (uses %)
+
 MAX_STATES = 6
 ROPE_LEN = 32768  # tables for cap <= this are built once; growing past it rebuilds them and drops the graphs
 FP8 = os.environ.get("ENGINE_FP8", "1") == "1"  # tensorwise-fp8 prefill GEMMs (owner-authorized)
@@ -850,6 +861,10 @@ class Engine:
         st.gpos = torch.zeros(B, dtype=torch.long, device=self.dev)
         st.limit = torch.zeros(1, dtype=torch.long, device=self.dev)
         st.T = torch.zeros(B, self.embed.shape[0], dtype=torch.long, device=self.dev)
+        st.prevtok = torch.zeros(B, dtype=torch.long, device=self.dev)
+        if SPEC_T2:
+            st.T2key = torch.full((B, SPEC_T2_SLOTS), -1, dtype=torch.long, device=self.dev)
+            st.T2val = torch.zeros(B, SPEC_T2_SLOTS, dtype=torch.long, device=self.dev)
         st.sin = torch.zeros(B, W, dtype=torch.long, device=self.dev)
         st.spos = torch.zeros(B, dtype=torch.long, device=self.dev)
         st.sout = torch.zeros(B, W, dtype=torch.long, device=self.dev)
@@ -884,17 +899,32 @@ class Engine:
         torch.cuda.synchronize()
 
     def _gspec_body(self, st):
-        """One in-graph step: chain K=W-1 table lookups for the draft, verify all W rows
-        in one forward, accept the longest correct prefix + 1 bonus token, recycle every
-        row's (input, model-output) pair into the table, advance tok/gpos."""
+        """One in-graph step: chain K=W-1 table lookups for the draft (2-token-context T2 hash
+        table when SPEC_T2, falling back to the 1-token T on a miss -- exactness is unaffected
+        either way, since verify+acceptance below is the only thing that decides an emitted
+        token), verify all W rows in one forward, accept the longest correct prefix + 1 bonus
+        token, recycle every row's (context, input, model-output) into both tables, advance
+        tok/prevtok/gpos."""
         B, W = st.B, st.W
         K = W - 1
         tok, T, limit = st.tok, st.T, st.limit
+        V = self.embed.shape[0] if SPEC_T2 else None
         drafts = []
-        cur = tok
-        for _ in range(K):
-            cur = T.gather(1, cur.unsqueeze(1)).squeeze(1)
-            drafts.append(cur)
+        if SPEC_T2:
+            u, v = st.prevtok, tok
+            for _ in range(K):
+                slot = (u * V + v) % SPEC_T2_SLOTS
+                hit = st.T2key.gather(1, slot.unsqueeze(1)).squeeze(1)
+                t2v = st.T2val.gather(1, slot.unsqueeze(1)).squeeze(1)
+                fallback = T.gather(1, v.unsqueeze(1)).squeeze(1)
+                cur = torch.where(hit == u * V + v, t2v, fallback)
+                drafts.append(cur)
+                u, v = v, cur
+        else:
+            cur = tok
+            for _ in range(K):
+                cur = T.gather(1, cur.unsqueeze(1)).squeeze(1)
+                drafts.append(cur)
         rows = torch.stack([tok] + drafts, dim=1) if K else tok.unsqueeze(1)  # (B, W)
         st.sin.copy_(rows)
         st.spos.copy_(st.gpos)
@@ -908,6 +938,13 @@ class Engine:
         else:
             acc = torch.zeros(B, dtype=torch.long, device=tok.device)
         T.scatter_(1, rows, st.sout)  # token recycling: T[input] = model's own next-token
+        if SPEC_T2:
+            ctxu = torch.cat([st.prevtok.unsqueeze(1), rows[:, :-1]], dim=1) if K else st.prevtok.unsqueeze(1)
+            key2 = ctxu * V + rows
+            slot2 = key2 % SPEC_T2_SLOTS
+            st.T2key.scatter_(1, slot2, key2)  # store the key alongside the value: a probe whose
+            st.T2val.scatter_(1, slot2, st.sout)  # stored key doesn't match is a miss, not a wrong hit
+            st.prevtok.copy_(rows.gather(1, acc.unsqueeze(1)).squeeze(1))
         st.gacc.copy_(acc)
         st.tok.copy_(st.sout.gather(1, acc.unsqueeze(1)).squeeze(1))
         st.gpos.copy_(torch.minimum(st.gpos + acc + 1, limit))
@@ -928,6 +965,21 @@ class Engine:
         if S >= 2:
             st.T.scatter_(1, ids[:, :-1], ids[:, 1:])
         st.T.scatter_(1, ids[:, -1:], st.tok.unsqueeze(1))
+        st.prevtok.copy_(ids[:, -1])  # token before the first generated token, for T2's context
+        if SPEC_T2:
+            st.T2key.fill_(-1)  # states are cached and reused across calls with different prompts
+            V = self.embed.shape[0]
+            if S >= 3:
+                u, v, nxt = ids[:, :-2], ids[:, 1:-1], ids[:, 2:]  # seed from prompt trigrams
+                key = u * V + v
+                slot = key % SPEC_T2_SLOTS
+                st.T2key.scatter_(1, slot, key)
+                st.T2val.scatter_(1, slot, nxt)
+            if S >= 2:  # (2nd-to-last, last) prompt token -> first generated token
+                key1 = (ids[:, -2] * V + ids[:, -1]).unsqueeze(1)
+                slot1 = key1 % SPEC_T2_SLOTS
+                st.T2key.scatter_(1, slot1, key1)
+                st.T2val.scatter_(1, slot1, st.tok.unsqueeze(1))
         st.gpos.fill_(S)
         first = st.tok.tolist()
         out = [[t] for t in first]
