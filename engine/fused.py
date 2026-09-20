@@ -711,8 +711,17 @@ GEMM_CFG_64 = {
     # overridden here so they keep their tuned BK -- cutting BK there was tested and
     # measurably worse (see report). SK unchanged (2) to preserve reduction order.
     (2560, 4096): (64, 256, 2, 3, 4),
+    # 'down' fits the BM=16 footprint as-is, but a BM=64 sweep found ST 4->3 alone is
+    # -11.3% (36.86 -> 32.68 us, 1.35 -> 1.52 TB/s). BN/BK/SK unchanged, so the SK=4
+    # reduction order is untouched.
+    (2560, 9728): (32, 128, 4, 3, 4),
 }
-SILU_CFG_64 = {}
+SILU_CFG_64 = {
+    # 'gate_up' also fits unchanged, but BK 128->64 with NW 2->4 is -14.4% at BM=64
+    # (55.44 -> 47.47 us, 1.80 -> 2.10 TB/s). gate_up_silu has no split-K, so there is
+    # no reduction order to preserve here.
+    (9728, 2560): (32, 64, 4, 4),
+}
 
 
 # BM=128: shared-memory need grows again (roughly stages*(BM+BN)*BK*2), so qkv/o/lm_head need
