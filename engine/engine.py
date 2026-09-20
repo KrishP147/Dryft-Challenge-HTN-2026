@@ -36,8 +36,15 @@ SPEC_ROWS = 64  # max B*W rows through the skinny GEMVs (raised from 16: BM_MAX=
 # Aggressive defaults (min batch 4, min output 96): only the best eligible official run counts,
 # so an unstable_timing failure costs one queue slot and nothing else, while B4's measured 2.32x
 # (CV 20%) is the largest win found tonight. SPEC_MIN_B=16 is the conservative fallback (CV ~5.5%).
-SPEC_MIN_B = int(os.environ.get("ENGINE_SPEC_MIN_B", "4"))
-SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", "512"))
+SPEC_MIN_B = int(os.environ.get("ENGINE_SPEC_MIN_B", "2"))
+SPEC_MAX_B = int(os.environ.get("ENGINE_SPEC_MAX_B", "8"))  # cap: B16 spec lost on the platform
+                # (public-2 512->128 went +16% slower officially) and its 5-sample CV is highest;
+                # exclude it. B1 excluded via SPEC_MIN_B=2 (single-sequence timing CV ~73% locally).
+SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", "128"))  # short outputs never reach the
+                # repetition region where greedy Qwen's own n-grams start hitting; below this the
+                # verify rows are pure overhead. Pod (pydoc): B4 2048->256 +48.7%, B2 +30.8%,
+                # B8 +15.5% net tok/s with spec on; B4->32 only +6%. Gate on n so short hidden
+                # workloads run the plain path (bit-identical to spec-off, zero risk there).
 SPEC_W_OVERRIDE = os.environ.get("ENGINE_SPEC_W")  # force a specific W for the A/B sweep
 MAX_STATES = 6
 ROPE_LEN = 32768  # tables for cap <= this are built once; growing past it rebuilds them and drops the graphs
@@ -535,7 +542,7 @@ class Engine:
             yield from self._generate_ragged(input_ids, max_new_tokens)
             return
         n = max_new_tokens
-        if self.spec_ok and SPEC and B >= SPEC_MIN_B and n >= SPEC_MIN_N:
+        if self.spec_ok and SPEC and SPEC_MIN_B <= B <= SPEC_MAX_B and n >= SPEC_MIN_N:
             W = int(SPEC_W_OVERRIDE) if SPEC_W_OVERRIDE else min(SPEC_W_MAX, SPEC_ROWS // B)
             W = max(1, min(W, SPEC_ROWS // B, SPEC_W_MAX))
             if W >= 2:
