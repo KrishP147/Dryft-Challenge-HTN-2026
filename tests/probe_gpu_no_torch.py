@@ -249,14 +249,15 @@ for ptr in buffers:
 call("cuModuleUnload", module)
 
 # At NSPLIT=1 the attention kernel writes directly into token-major output.
-# Zero queries/keys give uniform weights; token 0 sees V[0], token 1 their mean.
+# The second batch row starts at position 2, so its queries see three and four
+# values. Nonzero Q/K scores check the softmax weighting as well as causality.
 B, NKV, G, HD, CAP, W = 2, 2, 4, 32, 32, 2
 source = ASTSource(
     _attn_split_kernel,
     {0: "*bf16", 1: "*bf16", 2: "*bf16", 3: "*i64",
      4: "*bf16", 5: "*bf16", 6: "i32", 7: "fp32"},
     {8: 1, 9: G, 10: W, 11: 16, 12: HD, 13: 64,
-     14: NKV, 15: 0, 16: False, 17: 0},
+     14: NKV, 15: 1, 16: False, 17: 0},
 )
 kernel = triton.compile(source, target=GPUTarget("cuda", sm, 32),
                         options={"num_warps": 4, "num_stages": 2})
@@ -271,11 +272,27 @@ host_av = (c.c_uint16 * (B * NKV * CAP * HD))()
 for b in range(B):
     for h in range(NKV):
         base = (b + 1) * (h + 1) * 0.25
+        for s in range(W):
+            for g in range(G):
+                host_aq[(((b * NKV + h) * W + s) * G + g) * HD] = bf16(2 * (s + 1))
+        for j in range(4):
+            host_ak[((b * NKV + h) * CAP + j) * HD] = bf16(2 * (j + 1))
         for d in range(HD):
             host_av[((b * NKV + h) * CAP) * HD + d] = bf16(base)
             host_av[((b * NKV + h) * CAP + 1) * HD + d] = bf16(3 * base)
-host_ap = (c.c_int64 * 1)(0)
+            if b == 1:
+                host_av[((b * NKV + h) * CAP + 2) * HD + d] = bf16(5 * base)
+                host_av[((b * NKV + h) * CAP + 3) * HD + d] = bf16(7 * base)
+host_ap = (c.c_int64 * B)(0, 2)
 host_ao = (c.c_uint16 * (B * W * NKV * G * HD))()
+
+def attention_expected(b, h, s):
+    base = (b + 1) * (h + 1) * 0.25
+    scores = [4 * (s + 1) * (j + 1) * HD ** -0.5 for j in range(b * 2 + s + 1)]
+    peak = max(scores)
+    weights = [math.exp(score - peak) for score in scores]
+    return sum(weight * (2 * j + 1) * base for j, weight in enumerate(weights)) / sum(weights)
+
 attn_hosts = [host_aq, host_ak, host_av, host_ap, host_ao]
 attn_buffers = [c.c_uint64() for _ in attn_hosts]
 for ptr, buf in zip(attn_buffers, attn_hosts):
@@ -293,24 +310,23 @@ call("cuCtxSynchronize")
 call("cuMemcpyDtoH_v2", host_ao, attn_buffers[4], c.sizeof(host_ao))
 for b in range(B):
     for h in range(NKV):
-        base = (b + 1) * (h + 1) * 0.25
         for s in range(W):
-            expected = bf16(base if s == 0 else 2 * base)
+            expected = attention_expected(b, h, s)
             for g in range(G):
                 for d in range(HD):
                     idx = ((b * W + s) * NKV * G + h * G + g) * HD + d
-                    assert host_ao[idx] == expected, (b, s, h, g, d)
+                    assert abs(from_bf16(host_ao[idx]) - expected) < 0.02, (b, s, h, g, d)
 print(f"Single-split direct attention: GPU correctness OK on SM{sm}")
 call("cuModuleUnload", module)
 
-# Two splits exercise the log-sum-exp combine. Token 0 masks every key in the
-# second split; token 1 uses both splits and must average their different V's.
+# Two splits exercise the log-sum-exp combine. The first batch row has an empty
+# split for token 0; the second row crosses the split boundary for both tokens.
 source = ASTSource(
     _attn_split_kernel,
     {0: "*bf16", 1: "*bf16", 2: "*bf16", 3: "*i64",
      4: "*fp32", 5: "*bf16", 6: "i32", 7: "fp32"},
     {8: 2, 9: G, 10: W, 11: 16, 12: HD, 13: 64,
-     14: NKV, 15: 0, 16: False, 17: 0},
+     14: NKV, 15: 1, 16: False, 17: 0},
 )
 kernel = triton.compile(source, target=GPUTarget("cuda", sm, 32),
                         options={"num_warps": 4, "num_stages": 2})
@@ -352,13 +368,12 @@ call("cuCtxSynchronize")
 call("cuMemcpyDtoH_v2", host_ao, attn_buffers[4], c.sizeof(host_ao))
 for b in range(B):
     for h in range(NKV):
-        base = (b + 1) * (h + 1) * 0.25
         for s in range(W):
-            expected = bf16(base if s == 0 else 2 * base)
+            expected = attention_expected(b, h, s)
             for g in range(G):
                 for d in range(HD):
                     idx = ((b * W + s) * NKV * G + h * G + g) * HD + d
-                    assert host_ao[idx] == expected, ("combine", b, s, h, g, d)
+                    assert abs(from_bf16(host_ao[idx]) - expected) < 0.02, ("combine", b, s, h, g, d)
 print(f"Split-and-combine attention: GPU correctness OK on SM{sm}")
 call("cuMemFree_v2", gpu_ws)
 for ptr in attn_buffers:
