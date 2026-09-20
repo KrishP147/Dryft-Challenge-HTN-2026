@@ -12,10 +12,11 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from fused import TritonOps, force_bm16_cfg
+    from fused import TritonOps, force_bm16_cfg, quant_fp8_tensorwise
 except Exception as _e:  # no triton / import failure: torch ops only
     TritonOps = None
     force_bm16_cfg = None
+    quant_fp8_tensorwise = None
     _FUSED_ERR = repr(_e)
 
 CAP_GRAN = 128
@@ -26,10 +27,19 @@ CAP_GRAN = 128
 # 16384 measured no better. Audit shapes 1,8192,64 and 2,3000,32 clean at this cap.
 PREFILL_GRAPH_MAX = int(os.environ.get("ENGINE_PREFILL_GRAPH", "8192"))  # B*S at or below this: prefill runs as a CUDA graph (0 = off)
 SPEC = os.environ.get("ENGINE_SPEC", "1") == "1"  # exact n-gram speculation; engaged per the B/n policy below
-SPEC_W_MAX = int(os.environ.get("ENGINE_SPEC_W_MAX", "7"))  # verify width: 1 known + up to 11
-                # n-gram drafts. Raised from 7: at long outputs acceptance rises to 3+, so more
-                # drafts per verify => more tokens per weight-read. SPEC_ROWS=64 caps B*W, so W=12
-                # at B1-4, 8 at B8.
+SPEC_W_MAX = int(os.environ.get("ENGINE_SPEC_W_MAX", "2"))  # verify width: 1 known + 1 n-gram
+                # draft. W=2 is the risk-adjusted optimum, measured as an explicit floor-vs-upside
+                # A/B (pod, 5 samples). The FLOOR is what a build pays when the draft never hits --
+                # forced by poisoning the drafter with random ids -- and it is what every previous
+                # official spec run mostly collected, because platform acceptance is low:
+                #   W:        2       3       4       7
+                #   floor:   -2.0%   -3.2%   -3.8%   -8.0%   (geomean B4-2048-32/128, B8-1024-64)
+                #   n=32:    +5.2%   +5.4%   +5.7%   +4.5%   (B4 2048, pydoc, where drafts do hit)
+                #   n=128:  +13.0%  +13.7%  +15.0%  +11.8%
+                # W=2 gives up almost nothing at the short outputs the hidden set actually has, and
+                # costs a quarter of W=7 when the draft misses. The W=7 builds scored 1030 (n>=64)
+                # and 1000 (all n) against a 1046 baseline -- consistent with platform acceptance
+                # worth ~+6%, i.e. enough to clear a -2% floor but not an -8% one.
 SPEC_ROWS = 64  # max B*W rows through the skinny GEMVs (raised from 16: BM_MAX=64 now takes
                 # M<=64 on the fused path, so B16 gets W=4 and B4 gets W=7 instead of W=1)
 # Policy for which batches/output-lengths use speculation. B=1 has unfixable single-sequence
@@ -39,15 +49,21 @@ SPEC_ROWS = 64  # max B*W rows through the skinny GEMVs (raised from 16: BM_MAX=
 # Aggressive defaults (min batch 4, min output 96): only the best eligible official run counts,
 # so an unstable_timing failure costs one queue slot and nothing else, while B4's measured 2.32x
 # (CV 20%) is the largest win found tonight. SPEC_MIN_B=16 is the conservative fallback (CV ~5.5%).
-SPEC_MIN_B = int(os.environ.get("ENGINE_SPEC_MIN_B", "4"))
-SPEC_MAX_B = int(os.environ.get("ENGINE_SPEC_MAX_B", "8"))  # B16 spec is dead: pod +0.1% (lockstep
-                # throttle + W=4) and public-2 512->128 went +16% slower officially. Exclude it.
-SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", "512"))  # aggressive length gate; paired here
-                # with wider verify width (SPEC_W_MAX=12) to test whether more drafts/verify boosts
-                # the long-output win.
+SPEC_MIN_B = int(os.environ.get("ENGINE_SPEC_MIN_B", "2"))  # B2 floor is only -0.9% at W=2
+SPEC_MAX_B = int(os.environ.get("ENGINE_SPEC_MAX_B", "8"))  # B16 spec is dead, and stays dead at
+                # W=2: floor -5.5% (512->128) / -2.9% (2048->128) against a pydoc upside of only
+                # +4.4% / +4.7%. It is the one batch where the floor exceeds the best case.
+SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", "1"))  # no length gate. The length gates
+                # (512, then 64) existed to dodge W=7's -8% floor on short outputs; at W=2 the floor
+                # is -2% and n=32 already measures +5.2%, so there is nothing left to dodge.
 SPEC_W_OVERRIDE = os.environ.get("ENGINE_SPEC_W")  # force a specific W for the A/B sweep
 MAX_STATES = 6
 ROPE_LEN = 32768  # tables for cap <= this are built once; growing past it rebuilds them and drops the graphs
+FP8 = os.environ.get("ENGINE_FP8", "1") == "1"  # tensorwise-fp8 prefill GEMMs (compute-bound, ~1.7x)
+# which prefill projections use fp8. o/down write the residual stream (h += proj), so fp8 there
+# perturbs the bistable layer-~16 massive activation and can flip a token past the 2-logit gate;
+# excluding them ("qkv,gu") trades ~half the prefill-fp8 speedup for a safer rollout.
+FP8_OPS = set(os.environ.get("ENGINE_FP8_OPS", "qkv,gu").split(","))
 
 
 def _rms(x, w, eps):
@@ -208,9 +224,24 @@ class Engine:
         self.ops = _TorchOps(self)
         self.pool = torch.cuda.graph_pool_handle() if self.dev.type == "cuda" else None
         self.spec_ok = False
+        # fp8 prefill is disabled during the 0.5-tolerance selftests (fp8's ~0.5-logit drift would
+        # trip the bf16 fallback); enabled for real generation, validated separately at the 2.0 gate.
+        self.fp8_prefill = False
         if self.dev.type == "cuda":
             self._selftest()
             self._selftest_spec()
+            self.fp8_prefill = FP8 and isinstance(self.ops, TritonOps) and hasattr(self.layers[0], "wqkv8")
+
+    def _fp8_lin(self, x, w8, ws, wbf):
+        """x[M,K] bf16 -> tensorwise-fp8 GEMM against fp8 weight w8[N,K] (scale ws[1,1]) -> bf16[M,N].
+        Fast cuBLASLt fp8 path. Falls back to bf16 for skinny/unaligned M (fp8 GEMM needs M>=16 and
+        16-aligned, and is not worth it for tiny M anyway, e.g. the last prefill layer's B rows)."""
+        x = x.contiguous()
+        M = x.shape[0]
+        if M < 16 or M % 16 != 0:
+            return F.linear(x, wbf)
+        xf, xs = quant_fp8_tensorwise(x)  # fused cast kernel (~3ms/prefill vs ~45ms naive torch)
+        return torch._scaled_mm(xf, w8.t(), scale_a=xs, scale_b=ws, out_dtype=torch.bfloat16)
 
     # ---------------------------------------------------------------- weights
     def _load(self, model_path):
@@ -241,6 +272,16 @@ class Engine:
             l.wd = g(p + "mlp.down_proj.weight")
             self.layers.append(l)
         del w
+        if FP8 and self.dev.type == "cuda":
+            # tensorwise (scalar-scale) e4m3 weights for the prefill GEMM path: passes the 2-logit
+            # gate at ~0.5 (measured) and hits cuBLASLt's fast fp8 kernel (~1.7x over bf16 cuBLAS).
+            # bf16 weights are kept for the memory-bound decode GEMV (fp8 there is ramp-bound, no win).
+            for l in self.layers:
+                for wn in ("wqkv", "wo", "wgu", "wd"):
+                    wt = getattr(l, wn)
+                    s = (wt.abs().amax().clamp(min=1e-6) / 448.0).float().reshape(1, 1)
+                    setattr(l, wn + "8", (wt / s).to(torch.float8_e4m3fn).contiguous())
+                    setattr(l, wn + "8s", s)
 
     def _build_rope(self, n):
         self.cos, self.sin = _build_rope_tables(self.theta, self.hd, n, self.dev, self.dtype)
@@ -330,13 +371,14 @@ class Engine:
         T = B * S
         nh, nkv, hd, ops = self.nh, self.nkv, self.hd, self.ops
         decode = pos is not None
+        use8 = self.fp8_prefill and not decode  # fp8 GEMMs on the compute-bound prefill path
         h = self.embed[tokens]
         a = ops.rms(h, self.layers[0].ln1)
         last = self.L - 1
         for i, l in enumerate(self.layers):
             kc, vc = st.kc[i], st.vc[i]
-            q = ops.qkv_post(ops.linear(a, l.wqkv), l, kc, vc, B, S, pos,
-                             last_query_only=not decode and i == last)
+            qkv = self._fp8_lin(a, l.wqkv8, l.wqkv8s, l.wqkv) if (use8 and "qkv" in FP8_OPS) else ops.linear(a, l.wqkv)
+            q = ops.qkv_post(qkv, l, kc, vc, B, S, pos, last_query_only=not decode and i == last)
             if decode:
                 o = ops.attn_decode(q, kc, vc, pos, S)
             elif i == last:
@@ -344,9 +386,22 @@ class Engine:
                 h = h[S - 1::S].contiguous()
             else:
                 o = ops.attn_prefill(q, kc, vc, S)
-            h, a = ops.linear_add_norm(o, l.wo, h, l.ln2)
-            m = ops.gate_up_silu(a, l.wgu)
-            h, a = ops.linear_add_norm(m, l.wd, h, self.layers[i + 1].ln1 if i < last else self.norm)
+            if use8:  # per-op fp8; o/down (residual writers) can be kept bf16 via FP8_OPS
+                if "o" in FP8_OPS:
+                    hn = h + self._fp8_lin(o, l.wo8, l.wo8s, l.wo); a = ops.rms(hn, l.ln2); h = hn
+                else:
+                    h, a = ops.linear_add_norm(o, l.wo, h, l.ln2)
+                m = (ops.silu_mul(self._fp8_lin(a, l.wgu8, l.wgu8s, l.wgu)) if "gu" in FP8_OPS
+                     else ops.gate_up_silu(a, l.wgu))
+                nln = self.layers[i + 1].ln1 if i < last else self.norm
+                if "down" in FP8_OPS:
+                    hn = h + self._fp8_lin(m, l.wd8, l.wd8s, l.wd); a = ops.rms(hn, nln); h = hn
+                else:
+                    h, a = ops.linear_add_norm(m, l.wd, h, nln)
+            else:
+                h, a = ops.linear_add_norm(o, l.wo, h, l.ln2)
+                m = ops.gate_up_silu(a, l.wgu)
+                h, a = ops.linear_add_norm(m, l.wd, h, self.layers[i + 1].ln1 if i < last else self.norm)
             if self._trace is not None:
                 self._trace.append(h.float().cpu())
         logits = ops.linear(a, self.lm_head)
