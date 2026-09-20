@@ -76,6 +76,28 @@ Only `engine/` is submitted. Keep notes/tools/tokens outside it.
 - Official run-to-run variance is a prefill/TTFT tail, not decode: three official draws of the same build (1e460f5) scored 1041.1 / 1047.3 / 779.4 with TPOT identical to 0.01 ms (3.49/4.02/3.98) but public-2 TTFT 105 / 102 / 151 ms and metricMs 486 / 484 / 650. Private workloads are therefore prefill-heavy and score has a left tail the pod cannot see; sub-1% pod wins are not verifiable officially.
 - `tests/bench.py --check-all` teacher-forces every sample against the HF baseline.
 
+### Sep 20 overnight campaign (6 parallel agents): one win, nine kills
+
+**Shipped (+0.62%, commit 98a7244):** Triton flash prefill attention replacing torch SDPA (BLOCK 128/128, 8 warps, 3 stages), plus `_qkv_post_prefill_kernel` rewritten with wide 2D loads across all heads instead of a serial per-head load/normalize/rope/store chain (**93.3 -> 73.0 us, -22%**). Same RMS/rope arithmetic and bf16 rounding points, bit-equivalent by construction. 15-sample pod A/B: TTFT -2.1% on B4 2048->32 and B16 512->128.
+
+**The occupancy model was wrong.** `pred = util * 3.35 * 0.93` fits measured per-op bandwidth well but is **correlation, not mechanism**. A persistent balanced-grid GEMV (grid=132/264, uneven contiguous row ranges, BN swept *including 64*, register-resident accumulator, single store, SK=1, 108 configs) gave **+1.2% on qkv where the model predicted +34%**, +1.0% on o, and **-7 to -9% on down**. Pure-read qkv bandwidth is 2.21/2.28/2.25/2.25 TB/s at 96/132/264/528 CTAs — grid count does essentially nothing.
+
+**The real variable is kernel duration (ramp), and it is not recoverable.** Ramp measured against lm_head's 3.08 TB/s steady state: qkv +3.89us (27.6%), **o +5.62us (45.2%)**, gate_up +3.80us (10.5%), down +8.61us (34.7%) = **789 us/step = 18.8%**. Transfer-size curve: 21MB **+92%**, 31MB +35%, 50MB +17%, 100MB +5%, 200MB ~0% (launched vs resident). `o` is the worst op in the engine purely because it is the smallest. Batching R *independent* GEMVs into one launch amortises it (qkv 16.04 -> 11.19 us/round, R=1 -> 32) — **but real decode ops are all-to-all dependent**, so fusing needs grid syncs, and that is what kills it.
+
+**Megakernel: killed at the layer gate.** Grid-wide arrive/wait at 132 CTAs costs **1056 ns and does NOT overlap with in-flight cp.async** (1078 ns marginal) — the assumption the design rested on. Five implementations swept (1015-1763 ns); the naive one is best. Fused layer: **+17.1% at 0 syncs, -0.0% at the 6 syncs a real layer needs**, -3.2% at 8 — and worse against the production PDL baseline, since it replaces a PDL-overlapped boundary with a barrier that cannot overlap. Persistent streaming ceiling is **3.176 TB/s (95%)**, so use 3.176 not 3.35 as the practical roofline.
+
+**Also killed, all with in-engine numbers:** `num_warps` >4 on qkv/o/gate_up (monotonically worse; -26% to **-130%** at 16-32; gate_up's production warps=2 beats warps=4) | decode attention warps and tiles (+7.9% standalone, **+0.07% in-engine**) | per-site `ENGINE_PF_O`/`ENGINE_TRIG_O` for o (PF deeper monotonically worse to -1.5%; TRIG_O=0 is -1.9%; o's producer already triggers at kernel start) | prefill GEMM (**726 TFLOP/s = ~96% of cuBLAS's practical 756**, not worth attacking) | `_add_rms`/`_silu_mul` (flat across every config — already at their bulk-load ceiling) | `ENGINE_PREFILL_GRAPH` raised past the B*S=8192 exclusion (+0.34% over 3 pairs; capture verified real, peak memory actually *lower* graphed).
+
+**Deep memory-level parallelism is real but narrow.** A resident kernel goes **1.2 -> 3.176 TB/s** on outstanding-load depth (8-16 loads/thread, 512-1024 threads/CTA). It pays **only where a kernel has a serial per-item dependency chain to break** — it won `qkv_post` (-22%) and nothing else; `_add_rms`/`_silu_mul` already issue one wide load per row, and the short split-grid decode GEMVs are ramp-bound, not parallelism-bound.
+
+**Two methodology rules, both earned the hard way:**
+1. **Nothing from a standalone microbench ships without the `tests/bench.py` 5-sample in-engine number.** Three instances in one night: balanced grid; attention BN=32/NW=2 (+7.9% standalone, +0.07% in-engine with B4 *regressing*); and the historical 128-vs-256 attention target.
+2. **Pod A/B noise across process launches is ~1%, not the 0.4-1.3% within-process spread.** With *no code or env change between arms*, three repeated pairs gave +0.94% / +0.07% / +0.01%. **A single pair cannot resolve a sub-1% change** — run three and compare means, and prefer a direct per-kernel measurement plus a mechanism over an end-to-end delta.
+
+**New pre-existing violation catalogued:** B16 512->128, default pydoc corpus at `--samples 5`, **seq 11 step 125, gap 2.500** (emitted 688, argmax 260). Reproduces bit-identically with the new prefill paths disabled, so it is latent in the pre-existing build, not introduced. Earlier runs used `--samples 2-3` or non-default corpora and never hit that seed.
+
+**Tooling:** `tests/budget.py` looked up a stale 3-tuple state key and raised `KeyError` (real key is `(B, cap, W, slot, decode_graph)`; `generate()` passes `slot=S, decode_graph=n>1`) — fixed with a `(B, cap)` prefix match. Do not bench ops standalone with `ENGINE_PDL=1` (they stall in `griddepcontrol.wait` with no producer: 7556 us of "GEMV" inside a 4192 us step). `grid=264` at 1024 threads is 1 CTA/SM = deadlock for any spin-wait. Pin `huggingface_hub<1.0` on fresh pods (unpinned pulls 1.32.0 and breaks the `transformers==4.51.3` import) and use `hf download`, not the deprecated `huggingface-cli`.
+
 ## Local dev
 
 ### Need
