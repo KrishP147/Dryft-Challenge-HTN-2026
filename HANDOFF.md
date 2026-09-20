@@ -154,3 +154,33 @@ A second route was in flight at handoff: compiling CUDA C++ at runtime via **NVR
    **public** run (which never ranks) should surface submission stdout directly via
    `GET /runs/<id>/logs`. Print what worked; do not encode results in per-step sleeps.
    Note also that submission output is retained for operator review either way.
+
+---
+
+## 10. Addendum: official run variance is prefill, not decode
+
+Three reruns of the **same build** (`1e460f5`) scored 1041.1 / 1047.3 / **779.4**.
+
+| run | score | tpot p0/p1/p2 | p2 ttft | p2 p10→p90 |
+|---|---|---|---|---|
+| 5db91743 | 1041.1 | 3.49 / 4.02 / 3.98 | 104.8 | 609.7 → 612.5 |
+| bcc045d9 | 1047.3 | 3.49 / 4.03 / 3.99 | 102.3 | 606.9 → 609.9 |
+| ec11398b | **779.4** | 3.49 / 4.02 / 4.01 | **150.9** | **628.1 → 734.4** |
+
+**TPOT is identical to the centisecond in all three**, including the bad one. Decode is
+extremely reproducible; all of the variance is TTFT and the sample tail (3 ms spread →
+106 ms). `metricMs` moved +34% while public tok/s moved only −10%, so the private
+workloads took a much larger TTFT hit — consistent with the private set being
+prefill-heavy (§2).
+
+Consequences:
+
+- **There is no nondeterministic cliff in our engine to hunt.** A failed graph capture
+  falling back to eager decode would have wrecked TPOT; it did not move. This is
+  platform-side contention landing on prefill. (This corrects the natural first guess,
+  which was the `use_count > 0` capture-failure path in §8.)
+- **Official runs cannot validate sub-1% changes**, and the error is asymmetric: our pod
+  measures a 0.4-1.3% spread and cannot see this tail at all. Decide with pod A/B;
+  do not let one official run overturn a pod-measured result in either direction.
+- Best eligible run counts, so bad draws are harmless to standing — but a rerun campaign
+  is a lottery that burns serial queue slots, and is a user decision.
