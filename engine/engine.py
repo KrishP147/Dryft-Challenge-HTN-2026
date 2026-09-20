@@ -63,7 +63,7 @@ SPEC_MAX_B = int(os.environ.get("ENGINE_SPEC_MAX_B", _MAX_B_DEF))
 SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", _MIN_N_DEF))
 # B>=2 gate reaches down to n=32: margin acceptance lifted short-output acceptance, and public-1
 # (B4 2048->32) then reports spec tpot directly. B1 stays at SPEC_MIN_N (single-sequence CV risk).
-SPEC_MIN_N_MULTI = int(os.environ.get("ENGINE_SPEC_MIN_N_MULTI", "32" if SPEC_MODE == "gpu" else _MIN_N_DEF))
+SPEC_MIN_N_MULTI = int(os.environ.get("ENGINE_SPEC_MIN_N_MULTI", _MIN_N_DEF))
 SPEC_W_MAX = int(os.environ.get("ENGINE_SPEC_W_MAX", _W_MAX_DEF))
 SPEC_W_OVERRIDE = os.environ.get("ENGINE_SPEC_W")  # force a single fixed W (host mode: skip dynamic width choice)
 # --- host-mode dynamic multi-width spec knobs (see _generate_spec) ---
@@ -695,8 +695,8 @@ class Engine:
         if self.spec_ok and SPEC and SPEC_MIN_B <= B <= SPEC_MAX_B and n >= (SPEC_MIN_N if B == 1 else SPEC_MIN_N_MULTI):
             W = int(SPEC_W_OVERRIDE) if SPEC_W_OVERRIDE else min(SPEC_W_MAX, SPEC_ROWS // B)
             W = max(1, min(W, SPEC_ROWS // B, SPEC_W_MAX))
-            if SPEC_MODE == "gpu" and B > 4 and not SPEC_W_OVERRIDE:
-                W = 2  # B5-8: only one draft row pays (drafter sim: K=1 best at B>=4, M=16 rows)
+            if SPEC_MODE == "gpu" and B >= 4 and not SPEC_W_OVERRIDE:
+                W = 2  # B4-8 (official: W=4 at B4 2048->32 cost +8% tpot, accept~0): only one draft row pays (drafter sim: K=1 best at B>=4, M=16 rows)
             if W >= 2:
                 if SPEC_MODE == "gpu" and self.gspec_ok:
                     yield from self._generate_gspec(input_ids, n, W)
