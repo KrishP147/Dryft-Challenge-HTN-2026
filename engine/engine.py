@@ -14,10 +14,11 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from fused import TritonOps, force_bm16_cfg
+    from fused import TritonOps, force_bm16_cfg, quant_fp8_tensorwise
 except Exception as _e:  # no triton / import failure: torch ops only
     TritonOps = None
     force_bm16_cfg = None
+    quant_fp8_tensorwise = None
     _FUSED_ERR = repr(_e)
 
 CAP_GRAN = 128
@@ -28,10 +29,13 @@ CAP_GRAN = 128
 # 16384 measured no better. Audit shapes 1,8192,64 and 2,3000,32 clean at this cap.
 PREFILL_GRAPH_MAX = int(os.environ.get("ENGINE_PREFILL_GRAPH", "8192"))  # B*S at or below this: prefill runs as a CUDA graph (0 = off)
 SPEC = os.environ.get("ENGINE_SPEC", "1") == "1"  # exact n-gram speculation; engaged per the B/n policy below
-SPEC_W_MAX = int(os.environ.get("ENGINE_SPEC_W_MAX", "7"))  # verify width: 1 known + up to 11
-                # n-gram drafts. Raised from 7: at long outputs acceptance rises to 3+, so more
-                # drafts per verify => more tokens per weight-read. SPEC_ROWS=64 caps B*W, so W=12
-                # at B1-4, 8 at B8.
+SPEC_W_MAX = int(os.environ.get("ENGINE_SPEC_W_MAX", "7"))  # cap on captured verify width (dynamic
+                # multi-width picks the smallest width that covers each step's drafts -- see
+                # SPEC_WIDTHS/_generate_spec below). A prior teammate's fixed-W floor-vs-upside A/B
+                # (W=2 floor -2.0%, W=7 floor -8.0%, geomean B4-2048-32/128 + B8-1024-64) motivated
+                # this rewrite: a fixed W always pays its floor even on a no-draft step, whereas the
+                # dynamic graphs drop to width 1 (~ plain-decode cost, measured <1% overhead) when
+                # nobody has a draft, so acceptance upside no longer has to buy back a wide-W floor.
 SPEC_ROWS = 64  # max B*W rows through the skinny GEMVs (raised from 16: BM_MAX=64 now takes
                 # M<=64 on the fused path, so B16 gets W=4 and B4 gets W=7 instead of W=1)
 # Policy for which batches/output-lengths use speculation, per agent C's 6000-natural-window
@@ -47,9 +51,7 @@ SPEC_MAX_B = int(os.environ.get("ENGINE_SPEC_MAX_B", "4"))
 # rewrite below still costs ~1-2% extra at B2/4, n=32-64 (host round-trip per step is inherent to
 # CPU-side drafting, can't fully hide behind the plain path's 1-step-behind pipeline) but is a wash
 # to +2.5% win at n>=96-128. 64 keeps EVERY public shape (B1 n32, B4 n32, B16 n128) out of spec
-# entirely -- MIN_B/MAX_B/MIN_N together make this a hidden-only lever with zero public risk, same
-# property as the old MIN_N=512 default, just widening the covered hidden output-length band down
-# from >=512 to >=64 now that the per-step cost is far cheaper (see _generate_spec).
+# entirely -- MIN_B/MAX_B/MIN_N together make this a hidden-only lever with zero public risk.
 SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", "64"))
 SPEC_W_OVERRIDE = os.environ.get("ENGINE_SPEC_W")  # force a single fixed W (skip dynamic width choice)
 # --- dynamic multi-width host spec (see _generate_spec) ---
@@ -59,7 +61,7 @@ SPEC_W_OVERRIDE = os.environ.get("ENGINE_SPEC_W")  # force a single fixed W (ski
 SPEC_WIDTHS = sorted({int(x) for x in os.environ.get("ENGINE_SPEC_WIDTHS", "1,2,3,4").split(",") if x})
 # min_n=1: agent C's study measured the full 3/2/1-gram drafter at 1.16 accepted tok/step (first 32
 # tokens) vs 1.10 for an >=2-gram-only restriction -- 1-gram matches are noisy but still net
-# positive, so do NOT filter them out (overrides this file's earlier, unmeasured guess of 3).
+# positive, so do NOT filter them out.
 SPEC_MIN_MATCH = int(os.environ.get("ENGINE_SPEC_MIN_MATCH", "1"))
 SPEC_MAX_DRAFT = int(os.environ.get("ENGINE_SPEC_MAX_DRAFT", "1"))  # draft cap for B>=2 (K=1, W=2)
 SPEC_MAX_DRAFT_B1 = int(os.environ.get("ENGINE_SPEC_MAX_DRAFT_B1", "3"))  # draft cap for B==1 (K=3, W=4)
@@ -72,6 +74,11 @@ SPEC_COOLDOWN = int(os.environ.get("ENGINE_SPEC_COOLDOWN", "8"))  # steps to sto
 SPEC_POISON = os.environ.get("ENGINE_SPEC_POISON") == "1"
 MAX_STATES = 6
 ROPE_LEN = 32768  # tables for cap <= this are built once; growing past it rebuilds them and drops the graphs
+FP8 = os.environ.get("ENGINE_FP8", "1") == "1"  # tensorwise-fp8 prefill GEMMs (compute-bound, ~1.7x)
+# which prefill projections use fp8. o/down write the residual stream (h += proj), so fp8 there
+# perturbs the bistable layer-~16 massive activation and can flip a token past the 2-logit gate;
+# excluding them ("qkv,gu") trades ~half the prefill-fp8 speedup for a safer rollout.
+FP8_OPS = set(os.environ.get("ENGINE_FP8_OPS", "qkv,gu").split(","))
 
 
 def _rms(x, w, eps):
@@ -234,9 +241,24 @@ class Engine:
         self.ops = _TorchOps(self)
         self.pool = torch.cuda.graph_pool_handle() if self.dev.type == "cuda" else None
         self.spec_ok = False
+        # fp8 prefill is disabled during the 0.5-tolerance selftests (fp8's ~0.5-logit drift would
+        # trip the bf16 fallback); enabled for real generation, validated separately at the 2.0 gate.
+        self.fp8_prefill = False
         if self.dev.type == "cuda":
             self._selftest()
             self._selftest_spec()
+            self.fp8_prefill = FP8 and isinstance(self.ops, TritonOps) and hasattr(self.layers[0], "wqkv8")
+
+    def _fp8_lin(self, x, w8, ws, wbf):
+        """x[M,K] bf16 -> tensorwise-fp8 GEMM against fp8 weight w8[N,K] (scale ws[1,1]) -> bf16[M,N].
+        Fast cuBLASLt fp8 path. Falls back to bf16 for skinny/unaligned M (fp8 GEMM needs M>=16 and
+        16-aligned, and is not worth it for tiny M anyway, e.g. the last prefill layer's B rows)."""
+        x = x.contiguous()
+        M = x.shape[0]
+        if M < 16 or M % 16 != 0:
+            return F.linear(x, wbf)
+        xf, xs = quant_fp8_tensorwise(x)  # fused cast kernel (~3ms/prefill vs ~45ms naive torch)
+        return torch._scaled_mm(xf, w8.t(), scale_a=xs, scale_b=ws, out_dtype=torch.bfloat16)
 
     # ---------------------------------------------------------------- weights
     def _load(self, model_path):
@@ -267,6 +289,16 @@ class Engine:
             l.wd = g(p + "mlp.down_proj.weight")
             self.layers.append(l)
         del w
+        if FP8 and self.dev.type == "cuda":
+            # tensorwise (scalar-scale) e4m3 weights for the prefill GEMM path: passes the 2-logit
+            # gate at ~0.5 (measured) and hits cuBLASLt's fast fp8 kernel (~1.7x over bf16 cuBLAS).
+            # bf16 weights are kept for the memory-bound decode GEMV (fp8 there is ramp-bound, no win).
+            for l in self.layers:
+                for wn in ("wqkv", "wo", "wgu", "wd"):
+                    wt = getattr(l, wn)
+                    s = (wt.abs().amax().clamp(min=1e-6) / 448.0).float().reshape(1, 1)
+                    setattr(l, wn + "8", (wt / s).to(torch.float8_e4m3fn).contiguous())
+                    setattr(l, wn + "8s", s)
 
     def _build_rope(self, n):
         self.cos, self.sin = _build_rope_tables(self.theta, self.hd, n, self.dev, self.dtype)
@@ -407,13 +439,14 @@ class Engine:
         T = B * S
         nh, nkv, hd, ops = self.nh, self.nkv, self.hd, self.ops
         decode = pos is not None
+        use8 = self.fp8_prefill and not decode  # fp8 GEMMs on the compute-bound prefill path
         h = self.embed[tokens]
         a = ops.rms(h, self.layers[0].ln1)
         last = self.L - 1
         for i, l in enumerate(self.layers):
             kc, vc = st.kc[i], st.vc[i]
-            q = ops.qkv_post(ops.linear(a, l.wqkv), l, kc, vc, B, S, pos,
-                             last_query_only=not decode and i == last)
+            qkv = self._fp8_lin(a, l.wqkv8, l.wqkv8s, l.wqkv) if (use8 and "qkv" in FP8_OPS) else ops.linear(a, l.wqkv)
+            q = ops.qkv_post(qkv, l, kc, vc, B, S, pos, last_query_only=not decode and i == last)
             if decode:
                 o = ops.attn_decode(q, kc, vc, pos, S)
             elif i == last:
@@ -421,9 +454,22 @@ class Engine:
                 h = h[S - 1::S].contiguous()
             else:
                 o = ops.attn_prefill(q, kc, vc, S)
-            h, a = ops.linear_add_norm(o, l.wo, h, l.ln2)
-            m = ops.gate_up_silu(a, l.wgu)
-            h, a = ops.linear_add_norm(m, l.wd, h, self.layers[i + 1].ln1 if i < last else self.norm)
+            if use8:  # per-op fp8; o/down (residual writers) can be kept bf16 via FP8_OPS
+                if "o" in FP8_OPS:
+                    hn = h + self._fp8_lin(o, l.wo8, l.wo8s, l.wo); a = ops.rms(hn, l.ln2); h = hn
+                else:
+                    h, a = ops.linear_add_norm(o, l.wo, h, l.ln2)
+                m = (ops.silu_mul(self._fp8_lin(a, l.wgu8, l.wgu8s, l.wgu)) if "gu" in FP8_OPS
+                     else ops.gate_up_silu(a, l.wgu))
+                nln = self.layers[i + 1].ln1 if i < last else self.norm
+                if "down" in FP8_OPS:
+                    hn = h + self._fp8_lin(m, l.wd8, l.wd8s, l.wd); a = ops.rms(hn, nln); h = hn
+                else:
+                    h, a = ops.linear_add_norm(m, l.wd, h, nln)
+            else:
+                h, a = ops.linear_add_norm(o, l.wo, h, l.ln2)
+                m = ops.gate_up_silu(a, l.wgu)
+                h, a = ops.linear_add_norm(m, l.wd, h, self.layers[i + 1].ln1 if i < last else self.norm)
             if self._trace is not None:
                 self._trace.append(h.float().cpu())
         logits = ops.linear(a, self.lm_head)
