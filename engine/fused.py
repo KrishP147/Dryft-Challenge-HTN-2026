@@ -128,6 +128,28 @@ def _l2_prefetch(ptrs):
 
 
 @triton.jit
+def _fp8_quant_kernel(x_ptr, o_ptr, inv_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    idx = pid * BLOCK + tl.arange(0, BLOCK)
+    m = idx < n
+    x = tl.load(x_ptr + idx, mask=m, other=0.0).to(tl.float32)
+    inv = tl.load(inv_ptr)
+    tl.store(o_ptr + idx, (x * inv).to(o_ptr.dtype.element_ty), mask=m)
+
+
+def quant_fp8_tensorwise(x):
+    """x contiguous bf16 [M,K] -> (xf e4m3, scale [1,1] fp32) via one fused cast kernel."""
+    mn, mx = torch.aminmax(x)
+    amax = torch.maximum(mx.to(torch.float32).abs(), mn.to(torch.float32).abs()).clamp(min=1e-6)
+    scale = (amax / 448.0).reshape(1, 1)
+    inv = (448.0 / amax).reshape(1)
+    xf = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    n = x.numel()
+    _fp8_quant_kernel[(triton.cdiv(n, 4096),)](x, xf, inv, n, BLOCK=4096, num_warps=8)
+    return xf, scale
+
+
+@triton.jit
 def _add_rms_kernel(
     x_ptr, d_ptr, w_ptr, h_ptr, y_ptr, n_cols, eps,
     HAS_ADD: tl.constexpr, BLOCK: tl.constexpr,
