@@ -51,7 +51,10 @@ corpus = tokzr(text, add_special_tokens=False)["input_ids"]
 print(f"corpus {args.corpus}: {len(corpus)} tokens", flush=True)
 
 CS = [1, 2, 3, 4, 6, 8]
-hits = {(name, c): 0 for name in ("recent", "freq", "recent_bo", "freq_bo") for c in CS}
+# Each strategy is (max n-gram order, backoff?).  "g1" is exactly the gpu path's token-recycling
+# table T[v] = what followed v last time, so it is the baseline to beat.
+STRATS = ("g1", "g2", "g3", "g3_freq")
+hits = {(name, c): 0 for name in STRATS for c in CS}
 total = 0
 
 import random  # noqa: E402
@@ -72,15 +75,17 @@ for rep in range(args.reps):
                 if i >= n:
                     occ[n - 1][tuple(h[i - n : i])].append(i)
 
+        ORDERS = {"g1": (1,), "g2": (2, 1), "g3": (3, 2, 1), "g3_freq": (3, 2, 1)}
+
         def cands(strategy, C):
             res = []
-            order = (3, 2, 1) if strategy.endswith("_bo") else (3,)
+            order = ORDERS[strategy]
             for n in order:
                 key = tuple(h[len(h) - n :])
                 js = occ[n - 1].get(key)
                 if not js:
                     continue
-                if strategy.startswith("freq"):
+                if strategy.endswith("_freq"):
                     ranked = [t for t, _ in Counter(h[j] for j in js).most_common()]
                 else:
                     ranked = []
@@ -95,7 +100,7 @@ for rep in range(args.reps):
             return res
 
         for t_ in out[b]:
-            for name in ("recent", "freq", "recent_bo", "freq_bo"):
+            for name in STRATS:
                 for C in CS:
                     if t_ in cands(name, C):
                         hits[(name, C)] += 1
@@ -107,7 +112,7 @@ for rep in range(args.reps):
     print(f"rep {rep + 1}/{args.reps} done ({total} tokens)", flush=True)
 
 print(f"\ndepth-1 candidate hit rate, corpus={args.corpus}, shape {B},{S},{N}, {total} tokens")
-print(f"{'C':>3} " + " ".join(f"{n:>10}" for n in ("recent", "freq", "recent_bo", "freq_bo")))
+print(f"{'C':>3} " + " ".join(f"{n:>10}" for n in STRATS))
 for C in CS:
-    print(f"{C:>3} " + " ".join(f"{hits[(n, C)] / total:>10.3f}" for n in ("recent", "freq", "recent_bo", "freq_bo")))
+    print(f"{C:>3} " + " ".join(f"{hits[(n, C)] / total:>10.3f}" for n in STRATS))
 print("\nextra tokens/step = hit rate. Ships today: 'recent' at C=1 (3-gram, MIN_MATCH=3).")
