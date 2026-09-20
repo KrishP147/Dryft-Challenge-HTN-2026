@@ -1,0 +1,84 @@
+diff --git a/engine/fused.py b/engine/fused.py
+index 46657c0..31f723e 100644
+--- a/engine/fused.py
++++ b/engine/fused.py
+@@ -702,6 +702,17 @@ ATTN_TARGET_BIG = int(os.environ.get("ENGINE_ATTN_TARGET_BIG", "128"))
+ ATTN_ST = int(os.environ.get("ENGINE_ATTN_ST", "3"))
+ PF = int(os.environ.get("ENGINE_PF", "4"))
+ TRIG = int(os.environ.get("ENGINE_TRIG", "1"))
++# Largest M the fused GEMV path will take. Default 16 = today's behaviour exactly (above it we
++# fall back to cuBLAS, which costs the whole fused path: no Triton, no split-K, no PDL, and the
++# silu/add-rmsnorm epilogues decompose). The kernels are already generic in BM (`mm = rm < M`
++# masks), so raising this is a tile-tuning problem, not a correctness one. Hidden workloads run
++# shapes the 3 public ones (all B<=16) never exercise. Tune GEMM_CFG/SILU_CFG per BM before use.
++BM_MAX = int(os.environ.get("ENGINE_BM_MAX", "16"))
++
++
++def _bm(M):
++    """Tile rows for a given batch: >=16 (tl.dot minimum), power of 2, never below M."""
++    return max(16, triton.next_power_of_2(M))
+ 
+ # Triton causal flash-attention for prefill (token-major q, exp2 softmax): env-gated,
+ # default off until the in-engine A/B clears the bar (SHARED-CONTEXT rule 6).
+@@ -848,7 +859,7 @@ class TritonOps:
+         M, K = x.shape
+         N = w.shape[0]
+         cfg = GEMM_CFG.get((N, K))
+-        if (not self.use_gemv or cfg is None or M > 16 or not x.is_contiguous()
++        if (not self.use_gemv or cfg is None or M > BM_MAX or not x.is_contiguous()
+                 or not w.is_contiguous() or x.dtype != torch.bfloat16 or w.dtype != torch.bfloat16):
+             return torch.nn.functional.linear(x, w)
+         BN, BK, SK, ST, NW = cfg
+@@ -859,14 +870,14 @@ class TritonOps:
+             _launch(
+                 _gemv_kernel, (triton.cdiv(N, BN), 1),
+                 x, w, out, M, N, K, kps, N,
+-                BM=16, BN=BN, BK=BK, FINAL=True, num_warps=NW, num_stages=ST, PDL=PDL, PF=PF, TRIG=TRIG, EVENK=even,
++                BM=_bm(M), BN=BN, BK=BK, FINAL=True, num_warps=NW, num_stages=ST, PDL=PDL, PF=PF, TRIG=TRIG, EVENK=even,
+             )
+             return out
+         ws = torch.empty((SK, M, N), dtype=torch.float32, device=x.device)
+         _launch(
+             _gemv_kernel, (triton.cdiv(N, BN), SK),
+             x, w, ws, M, N, K, kps, N,
+-            BM=16, BN=BN, BK=BK, FINAL=False, num_warps=NW, num_stages=ST, PDL=PDL, PF=PF, TRIG=TRIG, EVENK=even,
++            BM=_bm(M), BN=BN, BK=BK, FINAL=False, num_warps=NW, num_stages=ST, PDL=PDL, PF=PF, TRIG=TRIG, EVENK=even,
+         )
+         _splitk_reduce_kernel[(triton.cdiv(M * N, 1024),)](ws, out, M * N, SK=SK, BLOCK=1024)
+         return out
+@@ -876,7 +887,7 @@ class TritonOps:
+         M, K = x.shape
+         I = wgu.shape[0] // 2
+         cfg = SILU_CFG.get((I, K))
+-        if (not self.use_gemv or cfg is None or M > 16 or not x.is_contiguous()
++        if (not self.use_gemv or cfg is None or M > BM_MAX or not x.is_contiguous()
+                 or not wgu.is_contiguous() or x.dtype != torch.bfloat16 or wgu.dtype != torch.bfloat16):
+             return self.silu_mul(self.linear(x, wgu))
+         BN, BK, ST, NW = cfg
+@@ -884,7 +895,7 @@ class TritonOps:
+         out = torch.empty((M, I), dtype=x.dtype, device=x.device)
+         _launch(
+             _gemv_silu_kernel, (triton.cdiv(I, BN),),
+-            x, wgu, out, M, I, K, BM=16, BN=BN, BK=BK, num_warps=NW, num_stages=ST, PDL=PDL, PF=PF, TRIG=TRIG,
++            x, wgu, out, M, I, K, BM=_bm(M), BN=BN, BK=BK, num_warps=NW, num_stages=ST, PDL=PDL, PF=PF, TRIG=TRIG,
+             EVENK=even,
+         )
+         return out
+@@ -894,7 +905,7 @@ class TritonOps:
+         M, K = x.shape
+         N = w.shape[0]
+         cfg = GEMM_CFG.get((N, K))
+-        if (not self.use_gemv or cfg is None or cfg[2] == 1 or M > 16
++        if (not self.use_gemv or cfg is None or cfg[2] == 1 or M > BM_MAX
+                 or not x.is_contiguous() or not w.is_contiguous() or not h.is_contiguous()
+                 or x.dtype != torch.bfloat16 or w.dtype != torch.bfloat16 or h.dtype != torch.bfloat16):
+             return self.add_rms(h, self.linear(x, w), lnw)
+@@ -905,7 +916,7 @@ class TritonOps:
+         _launch(
+             _gemv_kernel, (triton.cdiv(N, BN), SK),
+             x, w, ws, M, N, K, kps, N,
+-            BM=16, BN=BN, BK=BK, FINAL=False, num_warps=NW, num_stages=ST, PDL=PDL, PF=PF, TRIG=TRIG, EVENK=even,
++            BM=_bm(M), BN=BN, BK=BK, FINAL=False, num_warps=NW, num_stages=ST, PDL=PDL, PF=PF, TRIG=TRIG, EVENK=even,
+         )
+         hn = torch.empty_like(h)
+         y = torch.empty_like(h)
