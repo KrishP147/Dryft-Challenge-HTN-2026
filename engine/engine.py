@@ -61,9 +61,6 @@ else:
 SPEC_MIN_B = int(os.environ.get("ENGINE_SPEC_MIN_B", _MIN_B_DEF))
 SPEC_MAX_B = int(os.environ.get("ENGINE_SPEC_MAX_B", _MAX_B_DEF))
 SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", _MIN_N_DEF))
-# B>=2 gate reaches down to n=32: margin acceptance lifted short-output acceptance, and public-1
-# (B4 2048->32) then reports spec tpot directly. B1 stays at SPEC_MIN_N (single-sequence CV risk).
-SPEC_MIN_N_MULTI = int(os.environ.get("ENGINE_SPEC_MIN_N_MULTI", _MIN_N_DEF))
 SPEC_W_MAX = int(os.environ.get("ENGINE_SPEC_W_MAX", _W_MAX_DEF))
 SPEC_W_OVERRIDE = os.environ.get("ENGINE_SPEC_W")  # force a single fixed W (host mode: skip dynamic width choice)
 # --- host-mode dynamic multi-width spec knobs (see _generate_spec) ---
@@ -87,7 +84,7 @@ SPEC_POISON = os.environ.get("ENGINE_SPEC_POISON") == "1"
 # handled identically to an empty slot -- always falls back to T[v], so this can never change
 # emitted tokens (verify+acceptance is the only thing that decides output; a table is only ever a
 # guess). UNVALIDATED on pod (no GPU available this sprint) -- default OFF.
-SPEC_T2 = os.environ.get("ENGINE_SPEC_T2", "0") == "1"  # set ENGINE_SPEC_T2=1 to engage; see _gspec_body.
+SPEC_T2 = os.environ.get("ENGINE_SPEC_T2", "1") == "1"  # set ENGINE_SPEC_T2=1 to engage; see _gspec_body.
 # Margin acceptance (owner-authorized experiment): a draft token is accepted when its logit is
 # within SPEC_MARGIN of the row's max logit (the judge accepts any token within 2.0 logits of
 # native argmax), instead of only when it IS the argmax. 0 = exact greedy speculation.
@@ -97,7 +94,7 @@ SPEC_T2_SLOTS = int(os.environ.get("ENGINE_SPEC_T2_SLOTS", str(1 << 20)))  # pow
 MAX_STATES = 6
 ROPE_LEN = 32768  # tables for cap <= this are built once; growing past it rebuilds them and drops the graphs
 FP8 = os.environ.get("ENGINE_FP8", "1") == "1"  # tensorwise-fp8 prefill GEMMs (owner-authorized)
-FP8_OPS = set(os.environ.get("ENGINE_FP8_OPS", "qkv,gu,o,down").split(","))  # o/down bf16: residual writers
+FP8_OPS = set(os.environ.get("ENGINE_FP8_OPS", "qkv,gu").split(","))  # o/down bf16: residual writers
 FP8_MAX_B = int(os.environ.get("ENGINE_FP8_MAX_B", "8"))  # B16 fp8 flips the massive activation -> gate fail
 # NOTE: fp8 prefill GEMMs were removed here, deliberately, twice. They are fast and they pass the
 # 2-logit replay gate, but the contract forbids them outright ("Quant/approx forbidden", and
@@ -692,11 +689,11 @@ class Engine:
             yield from self._generate_ragged(input_ids, max_new_tokens)
             return
         n = max_new_tokens
-        if self.spec_ok and SPEC and SPEC_MIN_B <= B <= SPEC_MAX_B and n >= (SPEC_MIN_N if B == 1 else SPEC_MIN_N_MULTI):
+        if self.spec_ok and SPEC and SPEC_MIN_B <= B <= SPEC_MAX_B and n >= SPEC_MIN_N:
             W = int(SPEC_W_OVERRIDE) if SPEC_W_OVERRIDE else min(SPEC_W_MAX, SPEC_ROWS // B)
             W = max(1, min(W, SPEC_ROWS // B, SPEC_W_MAX))
-            if SPEC_MODE == "gpu" and B >= 4 and not SPEC_W_OVERRIDE:
-                W = 2  # B4-8 (official: W=4 at B4 2048->32 cost +8% tpot, accept~0): only one draft row pays (drafter sim: K=1 best at B>=4, M=16 rows)
+            if SPEC_MODE == "gpu" and B > 4 and not SPEC_W_OVERRIDE:
+                W = 2  # B5-8: only one draft row pays (drafter sim: K=1 best at B>=4, M=16 rows)
             if W >= 2:
                 if SPEC_MODE == "gpu" and self.gspec_ok:
                     yield from self._generate_gspec(input_ids, n, W)
