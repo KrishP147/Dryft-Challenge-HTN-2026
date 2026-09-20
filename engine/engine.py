@@ -12,10 +12,11 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from fused import TritonOps, force_bm16_cfg
+    from fused import TritonOps, force_bm16_cfg, quant_fp8_tensorwise
 except Exception as _e:  # no triton / import failure: torch ops only
     TritonOps = None
     force_bm16_cfg = None
+    quant_fp8_tensorwise = None
     _FUSED_ERR = repr(_e)
 
 CAP_GRAN = 128
@@ -48,6 +49,7 @@ SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", "512"))  # aggressive lengt
 SPEC_W_OVERRIDE = os.environ.get("ENGINE_SPEC_W")  # force a specific W for the A/B sweep
 MAX_STATES = 6
 ROPE_LEN = 32768  # tables for cap <= this are built once; growing past it rebuilds them and drops the graphs
+FP8 = os.environ.get("ENGINE_FP8", "1") == "1"  # tensorwise-fp8 prefill GEMMs (compute-bound, ~1.7x)
 
 
 def _rms(x, w, eps):
@@ -208,9 +210,24 @@ class Engine:
         self.ops = _TorchOps(self)
         self.pool = torch.cuda.graph_pool_handle() if self.dev.type == "cuda" else None
         self.spec_ok = False
+        # fp8 prefill is disabled during the 0.5-tolerance selftests (fp8's ~0.5-logit drift would
+        # trip the bf16 fallback); enabled for real generation, validated separately at the 2.0 gate.
+        self.fp8_prefill = False
         if self.dev.type == "cuda":
             self._selftest()
             self._selftest_spec()
+            self.fp8_prefill = FP8 and isinstance(self.ops, TritonOps) and hasattr(self.layers[0], "wqkv8")
+
+    def _fp8_lin(self, x, w8, ws, wbf):
+        """x[M,K] bf16 -> tensorwise-fp8 GEMM against fp8 weight w8[N,K] (scale ws[1,1]) -> bf16[M,N].
+        Fast cuBLASLt fp8 path. Falls back to bf16 for skinny/unaligned M (fp8 GEMM needs M>=16 and
+        16-aligned, and is not worth it for tiny M anyway, e.g. the last prefill layer's B rows)."""
+        x = x.contiguous()
+        M = x.shape[0]
+        if M < 16 or M % 16 != 0:
+            return F.linear(x, wbf)
+        xf, xs = quant_fp8_tensorwise(x)  # fused cast kernel (~3ms/prefill vs ~45ms naive torch)
+        return torch._scaled_mm(xf, w8.t(), scale_a=xs, scale_b=ws, out_dtype=torch.bfloat16)
 
     # ---------------------------------------------------------------- weights
     def _load(self, model_path):
@@ -241,6 +258,16 @@ class Engine:
             l.wd = g(p + "mlp.down_proj.weight")
             self.layers.append(l)
         del w
+        if FP8 and self.dev.type == "cuda":
+            # tensorwise (scalar-scale) e4m3 weights for the prefill GEMM path: passes the 2-logit
+            # gate at ~0.5 (measured) and hits cuBLASLt's fast fp8 kernel (~1.7x over bf16 cuBLAS).
+            # bf16 weights are kept for the memory-bound decode GEMV (fp8 there is ramp-bound, no win).
+            for l in self.layers:
+                for wn in ("wqkv", "wo", "wgu", "wd"):
+                    wt = getattr(l, wn)
+                    s = (wt.abs().amax().clamp(min=1e-6) / 448.0).float().reshape(1, 1)
+                    setattr(l, wn + "8", (wt / s).to(torch.float8_e4m3fn).contiguous())
+                    setattr(l, wn + "8s", s)
 
     def _build_rope(self, n):
         self.cos, self.sin = _build_rope_tables(self.theta, self.hd, n, self.dev, self.dtype)
@@ -330,13 +357,14 @@ class Engine:
         T = B * S
         nh, nkv, hd, ops = self.nh, self.nkv, self.hd, self.ops
         decode = pos is not None
+        use8 = self.fp8_prefill and not decode  # fp8 GEMMs on the compute-bound prefill path
         h = self.embed[tokens]
         a = ops.rms(h, self.layers[0].ln1)
         last = self.L - 1
         for i, l in enumerate(self.layers):
             kc, vc = st.kc[i], st.vc[i]
-            q = ops.qkv_post(ops.linear(a, l.wqkv), l, kc, vc, B, S, pos,
-                             last_query_only=not decode and i == last)
+            qkv = self._fp8_lin(a, l.wqkv8, l.wqkv8s, l.wqkv) if use8 else ops.linear(a, l.wqkv)
+            q = ops.qkv_post(qkv, l, kc, vc, B, S, pos, last_query_only=not decode and i == last)
             if decode:
                 o = ops.attn_decode(q, kc, vc, pos, S)
             elif i == last:
@@ -344,9 +372,16 @@ class Engine:
                 h = h[S - 1::S].contiguous()
             else:
                 o = ops.attn_prefill(q, kc, vc, S)
-            h, a = ops.linear_add_norm(o, l.wo, h, l.ln2)
-            m = ops.gate_up_silu(a, l.wgu)
-            h, a = ops.linear_add_norm(m, l.wd, h, self.layers[i + 1].ln1 if i < last else self.norm)
+            if use8:
+                hn = h + self._fp8_lin(o, l.wo8, l.wo8s, l.wo)
+                a = ops.rms(hn, l.ln2); h = hn
+                m = ops.silu_mul(self._fp8_lin(a, l.wgu8, l.wgu8s, l.wgu))
+                hn = h + self._fp8_lin(m, l.wd8, l.wd8s, l.wd)
+                a = ops.rms(hn, self.layers[i + 1].ln1 if i < last else self.norm); h = hn
+            else:
+                h, a = ops.linear_add_norm(o, l.wo, h, l.ln2)
+                m = ops.gate_up_silu(a, l.wgu)
+                h, a = ops.linear_add_norm(m, l.wd, h, self.layers[i + 1].ln1 if i < last else self.norm)
             if self._trace is not None:
                 self._trace.append(h.float().cpu())
         logits = ops.linear(a, self.lm_head)
