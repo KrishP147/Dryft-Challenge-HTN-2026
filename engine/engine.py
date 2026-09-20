@@ -8,6 +8,8 @@ import json
 import math
 import os
 
+import random as _rnd
+
 import torch
 import torch.nn.functional as F
 
@@ -55,6 +57,11 @@ SPEC_MIN_MATCH = int(os.environ.get("ENGINE_SPEC_MIN_MATCH", "3"))  # ignore 1/2
 SPEC_MAX_DRAFT = int(os.environ.get("ENGINE_SPEC_MAX_DRAFT", "1"))  # cap draft length (host + verify cost)
 SPEC_THROTTLE = int(os.environ.get("ENGINE_SPEC_THROTTLE", "1"))  # consecutive zero-accept drafts before cooldown
 SPEC_COOLDOWN = int(os.environ.get("ENGINE_SPEC_COOLDOWN", "8"))  # steps to stop drafting for that sequence
+# Measurement only (never set on the platform): drafts are replaced by ids that cannot match, so a
+# run reports the speculation FLOOR -- what the build costs when acceptance is 0. Local corpora all
+# overstate n-gram acceptance, so upside benchmarks alone have repeatedly picked gates that lost
+# officially; the floor is the half of the trade that is corpus-independent and therefore trustworthy.
+SPEC_POISON = os.environ.get("ENGINE_SPEC_POISON") == "1"
 MAX_STATES = 6
 ROPE_LEN = 32768  # tables for cap <= this are built once; growing past it rebuilds them and drops the graphs
 
@@ -162,6 +169,8 @@ class _NG:
         self._reg(len(self.h) - 1)
 
     def draft(self, k, min_n=1):
+        if SPEC_POISON:  # floor measurement: a draft that can never be accepted
+            return [_rnd.randrange(1000, 100000) for _ in range(k)]
         h = self.h
         L = len(h)
         for n in range(3, min_n - 1, -1):
