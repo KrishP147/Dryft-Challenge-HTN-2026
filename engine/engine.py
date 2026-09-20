@@ -23,9 +23,14 @@ CAP_GRAN = 128
 # eager (B4 17.4->16.6 GiB, B16 18.8->18.0 GiB) because graph-pool reuse beats ad-hoc allocation.
 # 16384 measured no better. Audit shapes 1,8192,64 and 2,3000,32 clean at this cap.
 PREFILL_GRAPH_MAX = int(os.environ.get("ENGINE_PREFILL_GRAPH", "8192"))  # B*S at or below this: prefill runs as a CUDA graph (0 = off)
-SPEC = os.environ.get("ENGINE_SPEC", "0") == "1"  # exact n-gram speculation, B=1 only; off by default (timing is content-dependent)
+SPEC = os.environ.get("ENGINE_SPEC", "1") == "1"  # exact n-gram speculation, B=1 only; engaged only at n >= SPEC_MIN_N below
 SPEC_W_MAX = 7  # verify width: 1 known token + up to 6 n-gram drafts
 SPEC_ROWS = 16  # max B*W rows through the skinny GEMVs
+# Short outputs never reach the region where greedy Qwen3 falls into repetition loops (the
+# original official failure was B1 512->32), so the draft rarely hits and verify overhead
+# dominates. Measured: B1 n=512 gives 1.93x TPOT (CV 25.3%, marginal), n=1024 gives 2.34x
+# (CV 18.0%, passes) -- gate on n so the loss case (short output) never engages.
+SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", "256"))
 MAX_STATES = 6
 ROPE_LEN = 32768  # tables for cap <= this are built once; growing past it rebuilds them and drops the graphs
 
@@ -471,7 +476,7 @@ class Engine:
             yield from self._generate_ragged(input_ids, max_new_tokens)
             return
         n = max_new_tokens
-        if self.spec_ok and SPEC and B == 1 and n >= 3:
+        if self.spec_ok and SPEC and B == 1 and n >= SPEC_MIN_N:
             yield from self._generate_spec(input_ids, n)
             return
         cap = -(-(S + n) // CAP_GRAN) * CAP_GRAN
