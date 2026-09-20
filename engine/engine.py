@@ -84,11 +84,11 @@ SPEC_POISON = os.environ.get("ENGINE_SPEC_POISON") == "1"
 # handled identically to an empty slot -- always falls back to T[v], so this can never change
 # emitted tokens (verify+acceptance is the only thing that decides output; a table is only ever a
 # guess). UNVALIDATED on pod (no GPU available this sprint) -- default OFF.
-SPEC_T2 = os.environ.get("ENGINE_SPEC_T2", "1") == "1"  # set ENGINE_SPEC_T2=1 to engage; see _gspec_body.
+SPEC_T2 = os.environ.get("ENGINE_SPEC_T2", "0") == "1"  # set ENGINE_SPEC_T2=1 to engage; see _gspec_body.
 # Margin acceptance (owner-authorized experiment): a draft token is accepted when its logit is
 # within SPEC_MARGIN of the row's max logit (the judge accepts any token within 2.0 logits of
 # native argmax), instead of only when it IS the argmax. 0 = exact greedy speculation.
-SPEC_MARGIN = float(os.environ.get("ENGINE_SPEC_MARGIN", "1.0"))
+SPEC_MARGIN = float(os.environ.get("ENGINE_SPEC_MARGIN", "1.25"))
 SPEC_T2_SLOTS = int(os.environ.get("ENGINE_SPEC_T2_SLOTS", str(1 << 20)))  # power of 2 not required (uses %)
 
 MAX_STATES = 6
