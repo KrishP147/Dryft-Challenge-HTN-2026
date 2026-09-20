@@ -17,7 +17,12 @@ except Exception as _e:  # no triton / import failure: torch ops only
     _FUSED_ERR = repr(_e)
 
 CAP_GRAN = 128
-PREFILL_GRAPH_MAX = int(os.environ.get("ENGINE_PREFILL_GRAPH", "4096"))  # B*S at or below this: prefill runs as a CUDA graph (0 = off)
+# 8192 covers both heavy public shapes exactly (B4x2048 and B16x512 are both B*S=8192), which the
+# old 4096 cap excluded. Measured in-engine: +0.34% over 3 repeated pairs, capture verified real
+# (st.pgraphs[S] holds a (sid, CUDAGraph) tuple, not False), and peak memory is LOWER graphed than
+# eager (B4 17.4->16.6 GiB, B16 18.8->18.0 GiB) because graph-pool reuse beats ad-hoc allocation.
+# 16384 measured no better. Audit shapes 1,8192,64 and 2,3000,32 clean at this cap.
+PREFILL_GRAPH_MAX = int(os.environ.get("ENGINE_PREFILL_GRAPH", "8192"))  # B*S at or below this: prefill runs as a CUDA graph (0 = off)
 SPEC = os.environ.get("ENGINE_SPEC", "0") == "1"  # exact n-gram speculation, B=1 only; off by default (timing is content-dependent)
 SPEC_W_MAX = 7  # verify width: 1 known token + up to 6 n-gram drafts
 SPEC_ROWS = 16  # max B*W rows through the skinny GEMVs
