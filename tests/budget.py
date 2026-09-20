@@ -39,7 +39,12 @@ for spec in SHAPES:
         ids = torch.randint(1000, 100000, (B, S), generator=g).tolist()
         list(eng.generate(ids, n))  # warm + capture
         cap = -(-(S + n) // CAP_GRAN) * CAP_GRAN
-        st = eng.states[(B, cap, 1)]
+        # state key is (B, cap, W, slot, decode_graph) and generate() passes slot=S,
+        # decode_graph=n>1 -- match on (B, cap) so this survives key-format changes
+        st = next((v for k, v in eng.states.items() if k[0] == B and k[1] == cap), None)
+        if st is None:
+            print(f"B{B} {S}->{n}: no state for (B={B}, cap={cap}); keys={list(eng.states)}")
+            continue
         if st.graph is None:
             print(f"B{B} {S}->{n}: no decode graph, skipping")
             continue

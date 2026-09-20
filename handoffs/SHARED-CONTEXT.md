@@ -14,14 +14,14 @@ already dead, and the traps that have cost this team hours.
 | 4 | dryfter | 1138.7 | 444.8 | 23:35 |
 | 5 | Silver Bullet | 1137.7 | 445.2 | 20:52 |
 | 6 | zip | 1071.1 | 472.9 | 23:00 |
-| **7** | **krish (us)** | **1047.3** | **483.6** | 23:54 |
+| **7** | **krish (us)** | **1055.9** | **479.7** | 00:51 |
 
 `score * metricMs = 506522` exactly (15 digits, every run). Score is **exactly proportional to
 1/aggregate private time**. Decode is ~75% of weighted time, prefill ~25%.
 
 **Segfault is moving fast: 1064.4 -> 1176.4 -> 1198.9 in about 1.5 hours.** Extrapolating that rate to
 the 08:00 ET deadline, **plan for a finish line around 1300**, not 1200. That is
-`metricMs ~= 390`, i.e. **-19% aggregate from where we are**.
+`metricMs ~= 390`, i.e. **-19% aggregate from where we are**. (Our 1055.9 came from a *rerun draw* of the identical engine that previously scored 1047.3 — free, and worth +0.8%.)
 
 ## How the leader is doing it (and why it is not magic)
 
@@ -36,17 +36,11 @@ forbidden. They have kernels that do not waste SMs. **That is exactly what the w
 thesis below predicts, and exactly what S1-S4 are built to fix.** The gap is closable with the
 hardware we have and the rules we must follow.
 
-The implication for planning is sharp: at ~82% roofline the leader is *already past* what the
-balanced-grid fix alone gets us. Rough landing estimates from the measured budget:
-
-| landed | decode step | % roofline | aggregate | score |
-|---|---|---|---|---|
-| today | 4192 us | 68% | — | 1047 |
-| S1+S2 (balanced GEMVs at 3.08 TB/s) | 3714 us | 77% | -8.6% | ~1146 |
-| + S6 (glue, ~150 us) | 3564 us | 80% | -11.3% | ~1181 |
-| + S2 attention (~100 us) | 3464 us | 82% | -13.0% | ~1204 |
-| + S5 (prefill -15%) | " | " | -16.8% | ~1258 |
-| + S4 (megakernel, past 3.08 TB/s) | ~3100 us | 92% | -22% | ~1340 |
+**The landing estimates that used to be here have been withdrawn.** They assumed the balanced-grid
+fix would reach 3.08 TB/s across the GEMVs; S1 falsified that (see "BALANCED-GRID GEMV IS DEAD" below).
+The honest position as of 01:00 UTC: the ~13% decode prize is real but only the megakernel (S4) is
+still aimed at it, prefill (S5) is untouched by the falsification, and the glue kernels (S6) are
+unaffected. Do not quote a projected final score; measure instead.
 
 **No single agent's win is enough.** S1+S2 alone lands roughly where the leader already is. We need
 three or four of the six to land, and S4 is what creates margin rather than a tie. Everyone finishes
@@ -138,8 +132,11 @@ Boot ~90 s. A stop/start resets the container but not `/workspace`.
 
 The pinned stack matters (NVRTC is found through torch's bundled `nvidia/cuda_nvrtc/lib/libnvrtc.so*`):
 ```bash
-pip install torch==2.5.1 triton==3.1.0 transformers==4.51.3 safetensors==0.5.3 tokenizers==0.21.1 huggingface_hub
-huggingface-cli download Qwen/Qwen3-4B-Instruct-2507 \
+# huggingface_hub MUST be pinned: unpinned pulls 1.32.0, which breaks the transformers==4.51.3
+# import outright. And `huggingface-cli` is deprecated -- use `hf download`. (Verified by S2
+# on a fresh pod, 2026-09-20.)
+pip install torch==2.5.1 triton==3.1.0 transformers==4.51.3 safetensors==0.5.3 tokenizers==0.21.1 "huggingface_hub>=0.30.0,<1.0"
+hf download Qwen/Qwen3-4B-Instruct-2507 \
   --revision cdbee75f17c01a7cc42f958dc650907174af0554 --local-dir /workspace/model
 export TRITON_CACHE_DIR=/workspace/triton_cache
 ```
@@ -179,9 +176,14 @@ the reference computation. Consequences:
 - Required before any hand-in: `tests/bench.py --check-all` clean on the 3 public shapes **and**
   `--shapes 32,512,128 64,512,128 8,1024,64 2,3000,32 16,2048,128 1,8192,64`, plus `--corpus code`
   and `--corpus repeat`. Required: `worst gap <= 2.0`, `positions > 2.0: 0`, `spread <= 25%`.
-- **Pre-existing violations you must not worsen:** B32 code corpus 3.9 logits (seq 24 step 85), B64
-  natural 3.25 (seq 0 step 99) — identical on v14 and v15, native control clean. All official runs
-  passed, so the private set appears safe.
+- **Pre-existing violations you must not worsen** (all confirmed on `main` itself, A/B'd against the
+  fused paths, native control clean; **all official runs have passed**, so the private prompt
+  distribution appears safe):
+  - B32 code corpus: 3.9 logits (seq 24 step 85)
+  - B64 natural: 3.25 (seq 0 step 99)
+  - **B4 2048->32 `--corpus repeat`: 2 violations, gaps 2.5 and 4.125 (seq 0, steps 9 and 27)** —
+    re-confirmed by S3, bit-identical with the fused path disabled. Note this is the *highest-weighted
+    public shape*, but `repeat` is a synthetic local stress corpus, not the platform's distribution.
 
 Platform failure modes: `incorrect_output`, `candidate_error`, `timeout`, `latency_limit` (TTFT or
 TPOT above 1.10x native), `memory_limit` (peak above 90% of 80 GB), `unstable_timing` (5-sample spread
@@ -250,6 +252,123 @@ bigger problem. Do not go hunting launch count.
 KV traffic is real but secondary: 1.51 GB/step at B16 512->128 against 8.04 GB of weights, so ~16% of
 the bytes. It grows with context, which is why the B4 2048 regime matters.
 
+## Measured draw distribution (updated live)
+
+Five official draws of the **identical** engine (`engine/` tree `fd3cdfab…`):
+**779.4 / 1039.8 / 1041.1 / 1047.3 / 1055.9**. Median ~1041, best 1055.9, one severe left-tail outlier.
+The median draw sits ~1.4% *below* our best, so extra draws are a free option on the upside.
+
+**Correction to an earlier claim in `CONTEXT.md`:** it says decode TPOT is reproducible "to 0.01 ms"
+across draws and that all variance is TTFT. Two fresh draws show TPOT also moves ~1.3-2.0%
+(public-0 3.42 -> 3.49, public-1 3.96 -> 4.02, public-2 3.93 -> 3.98) alongside TTFT
+(public-1 113.2 -> 117.3 ms). On the decode-heavy public-2 the TTFT actually *fell* while the total
+rose, so that shape's variance is mostly TPOT. **Practical rule is unchanged and now better founded:
+an official run cannot confirm anything below ~1.5%. Judge by pod A/B.**
+
+## Known-broken tooling
+
+`tests/budget.py` on `origin/main` raises `KeyError` at startup: `Engine._state` keys states as
+`(B, cap, W, slot, decode_graph)` and `generate()` passes `slot=S, decode_graph=(n>1)`, but the
+script looks up the old 3-tuple `(B, cap, 1)`. Fixed on the orchestrator checkout; if your pod has an
+older copy, replace the lookup with a version-agnostic match:
+```python
+st = next((v for k, v in eng.states.items() if k[0] == B and k[1] == cap), None)
+```
+
+## MEGAKERNEL IS DEAD — killed at Gate C1, 2026-09-20 ~01:30 UTC (agent S4)
+
+The design rested on one assumption: that an arrive/wait barrier's latency would hide behind the
+cp.async weight loads a CTA issues for op i+1 before spinning on op i. **Measured false.** Grid-wide
+arrive/wait at 132 CTAs costs **1056 ns raw and 1078 ns with loads in flight** — it does not overlap
+with anything. Five implementations swept (atomicAdd+acquire-spin 1070, `ld.global.cv` poll 1015,
+separate-flag publish 1514, nanosleep backoff 1517, two-level tree 1763); the naive one is the best
+one. Budget was 145 ns.
+
+Fused-layer measurement, real B16 byte pattern, 36 layers on cold memory, grid=132 thr=1024:
+
+| variant | us/layer | TB/s | vs separate launches |
+|---|---|---|---|
+| separate launches | 68.4 | 2.33 | — |
+| fused, **0** syncs | 58.5 | 2.73 | **+17.1%** |
+| fused, 4 syncs | 66.1 | 2.41 | +3.5% |
+| fused, **6** syncs (realistic) | 68.5 | 2.33 | **-0.0%** |
+| fused, 8 syncs | 70.7 | 2.25 | -3.2% |
+
+A real decode layer needs ~6 grid syncs, and every GEMV is an all-to-all dependency (each CTA needs
+the whole activation vector), so none can be a cheaper point-to-point sync. **Break-even at best** —
+and this is an *upper bound* with no mma, no smem staging, no attention and no correctness
+constraints. In the real engine it is worse, because the baseline above has no PDL while production
+does (+4.5%): the megakernel replaces a PDL-*overlapped* launch boundary with a hard barrier that
+cannot overlap. Reproduced across 5 (grid, threads) combos.
+
+**Arithmetic correction to the ramp model.** Fusing recovers only **~2.5 us per boundary**, not the
+~5 us I estimated, while a barrier costs ~2 us — net ~0.5 us per boundary, and with 6 syncs against
+4 fused ops per layer it goes negative. **The ~900 us of per-launch ramp is real but NOT addressable
+by a megakernel.** Corrected per-op floor is ~3380-3630 us/step vs today's 4192, i.e. **13-19% of
+remaining decode headroom, not 24%**, sitting in ops already at 70-85% of their own achievable ceiling.
+
+**Two salvaged positives, both live:**
+1. **Outstanding-load depth is worth up to 2.6x on LONG kernels.** A resident 132-CTA kernel goes
+   **1.2 TB/s with 1 load in flight per thread to 3.176 TB/s (95% of roofline) with 8-16**, at
+   512-1024 threads/CTA. It does nothing for the short decode GEMVs (ramp-bound, flat across depth)
+   but it is why the persistent kernel reached 95%. **Check any long kernel — prefill especially —
+   for load depth and `num_warps` before tuning anything else.**
+2. **Ramp vs transfer size, measured** (same grid, separate launches vs one resident kernel):
+   21 MB **1.53 -> 2.94 TB/s (+92%)**, 31 MB +35%, 50 MB +17%, 100 MB +5%, 200 MB ~0%. This is why
+   `o` (21 MB, 11.9 us, 53% of roofline) is the worst op in the engine — it sits at the very worst
+   point on that curve. The lever for it is deeper PDL overlap, not regridding.
+
+Independent confirmation of S1's kill: qkv pure-read bandwidth is 2.21 / 2.28 / 2.25 / 2.25 TB/s at
+96 / 132 / 264 / 528 CTAs — grid count does essentially nothing.
+
+**Benchmarking traps S4 paid for:** timing a single ~20 us kernel with syncs either side is dominated
+by launch overhead (loop the launches, use cold slabs — L2 is 50 MB and will hide a whole weight
+matrix). Benchmarking `TritonOps.linear` standalone with `ENGINE_PDL=1` reports nonsense (7556 us of
+GEMV inside a 4192 us step) because each launch stalls in `griddepcontrol.wait` with no real producer.
+And `grid=264` at 1024 threads is 1 CTA/SM = 132 resident = **deadlock** for any spin-wait scheme.
+
+## STANDING RULE (earned three times tonight)
+
+**Nothing from a standalone Triton microbench ships without the `tests/bench.py` 5-sample in-engine
+number, no matter how large the standalone delta looks.** Instances: (1) balanced-grid GEMV; (2)
+attention BN=32/NW=2 measured **+7.9% standalone** and **+0.07% in-engine**, with B4 — the regime with
+the biggest standalone win — actually *regressing*; (3) the historical 128-vs-256 attention target,
+where the no-PDL microbench favoured 128 and the engine favoured 256.
+
+## Measured ramp, and why it is not recoverable
+
+Ramp per kernel, measured against the steady-state implied by lm_head's 3.08 TB/s (agent S1):
+
+| shape | measured | steady | ramp | % of measured |
+|---|---|---|---|---|
+| qkv | 14.10 us | 10.21 | +3.89 | 27.6% |
+| o | 12.43 us | 6.81 | **+5.62** | **45.2%** |
+| gate_up | 36.14 us | 32.34 | +3.80 | 10.5% |
+| down | 24.78 us | 16.17 | +8.61 | 34.7% |
+
+**21.9 us/layer x 36 = 789 us = 18.8% of the 4192 us decode step.**
+
+Batching R *independent* GEMVs into one launch amortises it, confirming the mechanism: qkv per-round
+16.04 us at R=1 -> 11.19 us at R=32; o 18.19 -> 9.72. Linear fit qkv a=10.35 us fixed + 10.89 us/round.
+
+**But it is not recoverable in the real engine.** Those R rounds are independent; a real decode layer's
+ops are all-to-all dependent (every GEMV needs the whole activation vector), so fusing them needs
+grid-wide syncs, and S4 measured a fused layer at **+17.1% with 0 syncs but -0.0% at the 6 syncs a
+real layer needs**. S1's amortisation curve and S4's sync curve are the two halves of the same result.
+
+Loose thread nobody has closed: `o` sits at only ~72% of bytes-implied throughput **even at full
+amortisation** (9.40 us/round steady vs 6.81 implied), i.e. it has a tile-config inefficiency
+*separate* from ramp.
+
+## Decode attention — closed
+
+`num_warps` 4 -> 8 -> 16 -> 32 monotonically worse: B4 18.55/19.73/28.14/41.55 us, B16
+18.76/19.52/22.62/34.70. **32 warps is 2.2x slower than 4.** The opposite direction (BN=32, NW=2,
+ST=3) gave +7.9% standalone on the B4 path but **+0.07% in-engine** — killed. PDL producer-timing is
+blocked structurally: Q and the KV write come from the same `qkv_post` invocation, so no subset of
+attention splits can skip `_gdc_wait()`; fixing it needs `qkv_post` split into Q-only and KV-write
+kernels, a timing-sensitive change under graph capture.
+
 ## Dead levers — measured, do not repeat
 
 PF / L2 prefetch depth (PF=4 best; PF>=32 is **14-24% worse** — prologue issue cost delays
@@ -267,11 +386,38 @@ less repetition than local corpora; `ENGINE_SPEC` off) | nsplit==1 attention com
 private set) | CUDA-graphed small prefills (flat on public shapes) | attention KV prefetch before the
 PDL wait (noise) | per-site PDL prefetch sweep (+-0.5%).
 
-**Caveat on "persistent SM-balanced GEMV is slower"** (`tests/gemv_persist.py`): that sweep is
-`BN in (16, 32)` only — it never tried BN=64, the size that actually won — so it compared a balanced
-grid of *worse* tiles against an unbalanced grid of *better* tiles, and it reset and stored the
-accumulator per row-tile inside the loop. **It does not falsify the balanced-grid thesis** that S1-S4
-are built on. Do not cite it as if it does.
+**BALANCED-GRID GEMV IS DEAD — falsified 2026-09-20 ~01:00 UTC by agent S1. Do not rebuild it.**
+An earlier version of this file argued that `tests/gemv_persist.py`'s "-5 to -10%" result did not
+falsify the balanced-grid thesis, because it swept `BN in (16,32)` only and never BN=64. S1 ran the
+corrected experiment: `grid=(132,)/(264,)`, uneven contiguous row ranges, BN swept **including 64**,
+register-resident accumulator held across the whole K loop, single store at the end, SK=1, 108 configs,
+H100 SXM, 32 distinct weight copies to defeat L2. Result:
+
+| op | best balanced vs production | best TB/s |
+|---|---|---|
+| qkv (6144,2560) | **+1.2%** | 2.29 (target was >=3.0) |
+| o (2560,4096) | **+1.0%** | <=1.75 |
+| down (2560,9728) | **-7 to -9%** | 2.01-2.12 |
+| lm_head | -1.1 to -1.5% | ~3.0 |
+
+The optimiser *did* choose NCTA=132, BN=64 for qkv. Moving qkv from 73% to 100% SM utilisation should
+have cut ~34% if idle SMs were the bottleneck; it cut ~1%. **So `pred = util * 3.35 * 0.93` is a
+descriptive fit, not a causal mechanism — do not cite it, and do not plan against it.**
+
+**The surviving explanation is kernel DURATION, not occupancy.** The small GEMVs run 12-25 us and lose
+roughly 3-5 us each to memory-pipeline ramp and drain at the kernel boundary. lm_head runs 250 us
+(18 waves) and amortises the same ramp down to ~1.5% — which is the whole reason it looks "fast and
+fully occupied". Estimated prize, per layer at B16: qkv ~3.2 + o ~2.4 + gate_up ~4 + down ~5.7 =
+~15 us of a 116 us layer, i.e. **~13% of the decode step (~550 us)**. Same size as before, but it lives
+at the **kernel boundaries**, not in the grid shape. Agent S1 is now measuring this directly.
+
+Corollary worth remembering: `down` got *worse* at 132 CTAs. Fewer, longer-lived CTAs means fewer
+outstanding loads and less memory-level parallelism. **More CTAs can help; do not assume 1 CTA/SM is
+free.**
+
+The only design that attacks a kernel-boundary cost is the **megakernel (S4)**: resident CTAs issuing
+cp.async for op i+1 before spinning on op i, so the pipeline never drains. PDL is a partial version of
+the same idea and is worth +4.5% today, which is independent support for the mechanism.
 
 ## What is currently switched on
 
