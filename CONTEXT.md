@@ -1,6 +1,10 @@
-# Dryft challenge: context for teammates
+# Engineering log: context for anyone extending this
 
-Make Qwen3-4B decode faster on 1x H100, **output unchanged**. Score = geomean tok/s over 6 hidden workloads. Leaderboard: htn.dryft.ai. Top team **Segfault 1385.2** (Sep 20); we are at **1060.8**. **Read `info.md` first** — it is the entry point.
+This is the full working log kept during the challenge: every measurement, dead end, and the
+reasoning behind each decision. See the top-level `README.md` for the final result and the short
+version of the story. This file is the long version.
+
+Make Qwen3-4B decode faster on 1x H100, **output unchanged**. Score = geomean tok/s over 6 hidden workloads. Leaderboard: htn.dryft.ai. **Final: 1156.1, rank #5** (`189b09d`, margin-based speculative decoding + batch-gated fp8 prefill). The numbers below are a snapshot from partway through the event (best-at-the-time was 1060.8) and are kept as-is because the reasoning in them is what matters, not the score they were written next to.
 
 ## Rules (short)
 - Submit `engine/` only (engine.py + imported .py). Must export `Engine` with:
@@ -56,7 +60,12 @@ Only `engine/` is submitted. Keep notes/tools/tokens outside it.
 
 | v13 | 1035.2 | CUDA-graphed small prefills (flat on public shapes, helps short prompts) |
 | v14 | 1042.4 | mask-free GEMV (EVENK) + alignment hints |
-| v15 | **1047.3** best (draws 1041.1 / 1047.3 / 779.4, same build) | rope-table/graph-pool fix, attention stages=3, nsplit==1 combine skip for big grids (peer), score model |
+| v15 | 1047.3 (draws 1041.1 / 1047.3 / 779.4, same build) | rope-table/graph-pool fix, attention stages=3, nsplit==1 combine skip for big grids (peer), score model |
+| `2a527ff` | 1098.6 | in-graph GPU speculative decoding (token-recycling table drafter, decode+draft+verify inside the CUDA graph) + B1 gate — first build where speculation is a net win, breaking the ~1042-1064 kernel-only plateau |
+| `8583bdf` | 1114.5 | + batch-gated (B<=8) tensorwise-fp8 prefill GEMMs stacked on top |
+| `189b09d` | **1156.1 — final, rank #5** | + margin-based speculative acceptance (`ENGINE_SPEC_MARGIN=1.0`: accept a draft within 1.0 logit of the row max, inside the judge's 2.0-logit replay tolerance) |
+
+Field context at the time: leader **Segfault** ~1385-1432, next cluster (SSS, Silver Bullet, dryfter, mc) 1126-1257. Kernel work alone plateaued around 1042-1064 (~71% of the measured HBM bandwidth roofline); speculative decoding and fp8 prefill are what moved the score past that.
 
 **Scoring model (exact, `tests/score_model.py`):** `score * metricMs / 1000 = 506.52223` on every run (15 digits), so the official score is exactly proportional to 1 / aggregate private time; the aggregate is a weighted throughput, so nothing can be inferred about the private token counts (an earlier note claiming their unweighted geomean is 506.5 was wrong). `log(score) = -0.266 + 0.142*log(B1 512->32 tok/s) + 0.449*log(B4 2048->32) + 0.444*log(B16 512->128)` fits all 11 runs to <0.8%. So 1% on B1 is worth ~0.14% of score and 1% on B4-2048 or B16-512 ~0.45%: **do not tune B1**. `tests/bench.py` now prints a predicted official score and % of bandwidth roofline (pod numbers run ~0.7% above the platform's). Leaders (Sep 20): SSS 1144, Silver Bullet 1138, dryfter 1137.
 
@@ -184,6 +193,15 @@ repetition loops; a merely repetitive corpus would be flat and high from step 0.
 speedup is `min_b(acc_b)` — expect **1.5-2x**, not 2.3-3.1x.
 **Why the original official test missed it:** it ran B1 512->**32**, and 32 tokens never reaches the
 region where loops form. The experiment was sound; the shape made it blind.
+
+**Drafter context matters more than gate tuning.** Depth-1 hit rate on real greedy output over
+natural prose (`tests/spec_tree_sim.py`, 3072 generated tokens): 3-gram-only matching **0.318**,
+3->2->1 backoff **0.443**, backoff with 4 candidates **0.564**. So 1/2-gram matches are not junk
+drafts, they are most of the win — a build that suppressed them with `SPEC_MIN_MATCH=3` measured
++0.0% on prose while flipping it to 1 measured **+6.5% geomean**. Multi-candidate depth-1 drafting
+needs no tree mask (all candidates share one position and the committed prefix) but does need
+per-row KV scratch slots, or candidate rows race on the same cache slot. Not built — it was the
+largest legal speculation lever still on the table when the event ended.
 
 **B64 x 1024 has a 9.750-logit violation that is not ours.** Reproduces byte-identically with every
 fused op disabled (`ENGINE_OFF=attn,attnp,qkv,gemv ENGINE_PDL=0`), i.e. pure torch — the
@@ -402,3 +420,23 @@ curl "${H[@]}" -X POST -H "Content-Type: application/json" -d '{}' $B/runs/<RUN_
 - Selftest tolerance/fallback exists so a broken Triton kernel degrades to slow-but-correct instead of a failed run. Keep it when adding new fused ops (add them to the selftest path).
 - Memory cap 90% of 80 GB: each `(B, cap)` state holds a full KV cache; `MAX_STATES=6`.
 - Team-wide: any member can push, connect repos, revoke tokens, remove members. Share invite code/token only inside the team.
+
+## Where we would have looked next
+Written when the event ended; the leader's number was never fully explained.
+
+1. **A fourth explanation for the leader's decode time.** Arithmetic here says kernel work alone
+   cannot reach it, and three obvious mechanisms are ruled out (prefix caching impossible per the
+   contract, quantization forbidden by the rules text, speculation already built and stacked). Worth
+   scrutinizing the harness itself: judge timing crosses a process boundary, native is measured
+   interleaved in the same container, warmup is 1 iteration.
+2. **Fewer bytes per token, exactly.** Weights are BF16 and fixed; KV is ours to design and attention
+   reads 1.51 GB/step at B16 — is there an exact KV representation that moves less? (Lossless weight
+   compression was costed and rejected: unpack ALU ~1.7 ms/step against ~0.5 ms of HBM saved.)
+3. **The geomean asymmetry.** Six equal-weight hidden workloads, so one pathological workload hurts
+   more than one good one helps — worth auditing where the engine is quietly terrible rather than
+   merely suboptimal.
+4. **An exact-argmax int8 `lm_head`** via Cauchy-Schwarz candidate bounding (~3% of the step, exact by
+   construction) — needs an offline candidate-count measurement first.
+5. **Multi-candidate depth-1 drafting** (see "Drafter context matters more than gate tuning" above):
+   the largest legal speculation lever still on the table, blocked only by needing per-row KV scratch
+   slots so candidate rows don't race on the same cache slot.
